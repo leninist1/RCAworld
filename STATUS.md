@@ -124,6 +124,5 @@
 | Phase 5 | Logs 集成 | medium | ⬜ |
 | Phase 6 | 故障传播适配器 (Reason 分类) | high | ⬜ |
 | Phase 7 | 多粒度实体 (Pod/容器) | medium | ⬜ |
-| Phase 8 | NoiseLab 集成 | medium | ⬜ |
 | — | 论文撰写 | high | ⬜ |
 | — | 基线对比 (DynaCausal, CHASE, RUN) | high | ⬜ |

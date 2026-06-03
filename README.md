@@ -167,7 +167,6 @@ RCAWorld/
 | Phase 5 | Logs 集成 | Drain 日志解析 → 日志模板预测头 |
 | Phase 6 | 故障传播适配器 | 故障动作 encoding → 区分 Reason (why) |
 | Phase 7 | 多粒度实体 | Pod/容器/数据库 → 层次化根因定位 |
-| Phase 8 | NoiseLab 集成 | 世界模型输出 JSON 证据 → LLM 解释生成 |
 
 ---
 
