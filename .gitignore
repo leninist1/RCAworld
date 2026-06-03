@@ -1,0 +1,47 @@
+# Large binary/data files
+checkpoints/
+data/raw/
+data/processed/
+*.h5
+*.hdf5
+*.zip
+*.tar.gz
+
+# Python artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Environment
+.venv/
+venv/
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Tensorboard logs
+runs/
+lightning_logs/
+
+# Ruff
+.ruff_cache/
+
+# Misc
+*.log
+tmp/
