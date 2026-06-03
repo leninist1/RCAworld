@@ -42,6 +42,9 @@ lightning_logs/
 # Ruff
 .ruff_cache/
 
+# Model artifacts (archived separately)
+models_artifacts.tar.gz
+
 # Misc
 *.log
 tmp/
