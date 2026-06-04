@@ -8,30 +8,39 @@
 
 ## 实验结果总览
 
-| 实验 | 训练 | 测试系统 | 测试故障数 | Component Top-1 | C+T Top-1 | Top-3 | MRR | AvgRank |
-|------|------|----------|-----------|-----------------|-----------|-------|-----|---------|
-| Phase 0 (合成) | Synth Normal | Synth Fault | 5 | **80%** | — | — | — | 1.20 |
-| Source (分布内) | OB Day1 | OB Day1 | 24 | **100%** | — | 100% | 1.000 | 1.00 |
-| OB→TrainTicket | OB Day1 | TrainTicket | 14 | **79%** | — | 100% | 0.893 | 1.21 |
-| OB→Market/cb1 | OB Day1 | Market cloudbed-1 | 51 | **63%** | **61%** | 92% | 0.771 | 1.67 |
-| OB Day1→Day2 | OB Day1 | OB Day2 | 32 | **53%** | — | 78% | 0.686 | 2.66 |
-| OB→Market/cb2 | OB Day1 | Market cloudbed-2 | 49 | **29%** | **24%** | 86% | 0.507 | 2.78 |
-| OB→Bank | OB Day1 | Bank (银行) | 119 | **0%** | 0% | 5% | 0.221 | 4.84 |
-| OB→Telecom | OB Day1 | Telecom (电信) | — | — | — | — | — | — |
+### 窗口已知（oracle window，模型排序能力上界）
 
-> **C+T = Component + Time 联合命中**  
-> **OB = Online Boutique**  
-> 所有结果均**仅用正常数据预训练，零 RCA 标签训练**
+| 实验 | 训练 | 测试系统 | 故障数 | Top-1 | Top-3 | MRR |
+|------|------|----------|--------|-------|-------|-----|
+| Phase 0 (合成) | Synth Normal | Synth Fault | 5 | **80%** | — | — |
+| OB Day1 (源域) | OB Day1 | OB Day1 | 24 | **100%** | 100% | 1.00 |
+| OB→TrainTicket | OB Day1 | TrainTicket (10/45) | 14 | **79%** | 100% | 0.89 |
+| OB→Market/cb1 | OB Day1 | Market cloudbed-1 | 51 | **63%** | 92% | 0.77 |
+| OB→Market/cb2 | OB Day1 | Market cloudbed-2 | 49 | **29%** | 86% | 0.51 |
+| OB Day1→Day2 | OB Day1 | OB Day2 | 32 | **53%** | 78% | 0.69 |
+
+### 窗口未知（clean eval，不含 oracle leak）
+
+| 实验 | 模式 | 粒度 | 故障数 | Top-1 | Top-3 | MRR | vs Random |
+|------|------|------|--------|-------|-------|-----|-----------|
+| OB Day1 | Prior + Timestamp | service | 24 | **21%** | 38% | 0.39 | **2.1×** |
+| Bank | Prior + Timestamp | container | 16 | **38%** | 50% | 0.50 | **3.8×** |
+| Random | — | — | — | 10% | 30% | 0.34 | 1.0× |
+
+> **窗口已知**: 用根因服务的残差峰值定位窗口（oracle leak）→ 测量模型排序质量的上界  
+> **窗口未知 (clean)**: 用 record.csv 时间戳定位窗口（SRE 报告时间），无 oracle → 真实场景评估  
+> **OB = Online Boutique** | 所有训练仅用正常数据，零 RCA 标签
 
 ---
 
 ## 核心发现
 
-1. **领域内泛化强**：在微服务领域（OB→TrainTicket 79%, OB→Market 63%）世界模型学到可迁移的系统动力学规律
-2. **跨领域失效**：非微服务系统（Bank 0%, Telecom N/A）完全无法迁移 — 定义了方法的适用边界
-3. **时间泛化有限**：同一系统不同日期（Day1→Day2 53%）表明动力学具有时间特异性
+1. **模型学到了可迁移的动力学**：oracle window 内排序精度 63-100%（微服务领域），窗口正确时根因排序极强
+2. **窗口定位是主要瓶颈**：无 oracle 时 Top-1 从 83%→21%（-62pp），异常检测精度决定端到端性能
+3. **跨领域需粒度对齐**：Bank 服务级 0%，但容器级 38%（↑3.8×random）— 实体粒度匹配是关键
 4. **仅正常数据训练**：全程未使用任何故障标签，RCA 推理阶段零额外训练
-5. **Component + Time 可定位**：同时回答 where (63%) + when (61%)；Reason (why) 需要故障分类器，属于第二阶段工作
+5. **Reason (why) 不可用**：区分故障类型需要故障标签训练，属于第二阶段工作
+6. **图贡献有限**：RQ4 消融 NLL <0.1% 差异 — metrics 是主要信号源
 
 ---
 
