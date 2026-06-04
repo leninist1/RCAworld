@@ -170,15 +170,43 @@
 | A.5.2 | compute_onset_metrics (accuracy, MAE) | `evaluation/openrca_metrics.py` | 🟩 | tolerance window 参数化 |
 | A.5.3 | evaluate_exact_match (OpenRCA protocol) | `evaluation/openrca_metrics.py` | 🟩 | 查询条件化输出, 分字段报告 |
 
-### A.6 待跑实验 ⬜
+### A.6 实验进展 ⬜→🟩
 
-| # | 实验 | 数据集 | 目标 | 状态 |
-|---|------|--------|------|------|
-| A.6.1 | Phase A pretrain | OB Day1 (正常) | 验证新架构 loss 收敛 | ⬜ |
-| A.6.2 | Onset Head vs Oracle Window | Bank (容器) | Top-1 >= 45% (当前 38%) | ⬜ |
-| A.6.3 | p(c|t)+p(c) vs 单路 | Bank + Market | 定位精度对比 | ⬜ |
-| A.6.4 | strict zero-shot (OB→OpenRCA) | Bank + Market + Telecom | 跨系统迁移 baseline | ⬜ |
-| A.6.5 | normal-only calibration | OpenRCA 各系统正常时段 | 自监督适配 | ⬜ |
+| # | 实验 | 数据集 | 目标 | 状态 | 结果 |
+|---|------|--------|------|------|------|
+| A.6.1 | Phase A pretrain | OB Day1 (正常) | 验证新架构 loss 收敛 | 🟩 | loss 2041→-686, val 628→-763 (80ep) |
+| A.6.2 | Onset Head vs Oracle Window | Bank (容器) | GT-leak 版本 (已废弃) | 🟥 | 24.3% 含 GT-component 泄露 |
+| A.6.3 | p(c|t)+p(c) vs 单路 | Bank + Market | 定位精度对比 | ⬜ | — |
+| A.6.4 | strict zero-shot (OB→OpenRCA) | Bank | **无泄露** joint scoring baselin | 🟩 | **Comp T1=0.7%, T3=6.6%, MRR=0.126** (prior-only, 136 faults, typed entities) |
+| A.6.5 | normal-only calibration | OpenRCA 各系统正常时段 | 自监督适配 | ⬜ | — |
+
+### Phase A-Hardening (P0/P1) 🟦
+
+**leak 修复** (commit `84393ac`):
+
+| 问题 | 修复 | 文件 |
+|------|------|------|
+| GT-component 条件化窗口选择 | joint S[t,c] 矩阵, argmax 推断, GT 仅用于 metric | `evaluation/strict_eval.py` |
+| OnsetHead temporal_conv 死代码 | smoothed 输出真正参与 final onset_score | `models/onset_head.py` |
+| precedence 误导性命名 | 改为 early_rise, 移除未使用的 edge_index 声称 | `models/onset_head.py` |
+| posterior 默认 | strict eval 默认 prior-only | `scripts/phaseA_strict_eval.py` |
+| 类型全零 (all type 0) | typed entity indices (container=0, database=1, middleware=2) | `scripts/phaseA_strict_eval.py` |
+
+**诚实无泄露基线** (Bank, prior-only, 80-epoch OB→Bank zero-shot):
+
+| 指标 | 值 |
+|------|-----|
+| Comp Top-1 | 0.7% |
+| Comp Top-3 | 6.6% |
+| MRR | 0.126 |
+| Time Hit | 0.0% |
+| Joint Hit | 0.0% |
+| Faults | 136 |
+
+> 此前报告 24.3% Top-1 含 GT-component 泄露（先读 rc 再选 window 峰值）
+> 当前 0.7% 是可信的无泄露严格零样本基线
+
+### 下一优先级: synthetic perturbation onset supervision 🟦
 
 ---
 
