@@ -129,6 +129,12 @@ _MULTI_REASON_PATTERN = re.compile(
     r'The\s+(\d+)-th\s+predicted root cause reason is\s+([^\n\r]+)',
     re.IGNORECASE,
 )
+# Parse fault count from instruction text ONLY (never from scoring_points)
+_FAULT_COUNT_PATTERN = re.compile(
+    r'(?:a single|one)\s+failure|(\d+)\s+failures|(two|three|four|five)\s+failures',
+    re.IGNORECASE,
+)
+_FAULT_COUNT_WORDS = {"two": 2, "three": 3, "four": 4, "five": 5}
 _MONTH_MAP = {
     "january": 1, "february": 2, "march": 3, "april": 4,
     "may": 5, "june": 6, "july": 7, "august": 8,
@@ -194,6 +200,26 @@ def _parse_gt_reasons(scoring_points: str) -> List[str]:
     return reasons
 
 
+def _parse_fault_count_from_text(instruction: str) -> int:
+    """Parse fault count from instruction TEXT only (NEVER from GT/scoring_points).
+
+    Examples:
+      "a single failure was detected" -> 1
+      "one failure" -> 1
+      "two failures" -> 2
+      "three failures" -> 3
+      No mention -> 1 (default, safe for single-fault queries)
+    """
+    m = _FAULT_COUNT_PATTERN.search(instruction)
+    if not m:
+        return 1  # default: assume single fault
+    if m.group(1):
+        return int(m.group(1))
+    if m.group(2):
+        return _FAULT_COUNT_WORDS.get(m.group(2).lower(), 1)
+    return 1  # "a single" or "one" matched with no numeric capture
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # Main parse: returns separated InferenceQuery + EvalTarget
 # ═══════════════════════════════════════════════════════════════════════
@@ -246,11 +272,14 @@ def parse_query_csv(query_csv_path: str) -> Tuple[
         need_component = fields.get("need_component", True)
         need_reason = fields.get("need_reason", True)
 
-        # Parse GT from scoring_points (hidden)
+        # Parse GT from scoring_points (hidden, for EvalTarget only)
         gt_datetime, gt_tolerance = _parse_gt_time(scoring)
         gt_components = _parse_gt_components(scoring)
         gt_reasons = _parse_gt_reasons(scoring)
-        expected_fault_count = max(len(gt_components), len(gt_reasons), 1)
+        gt_fault_count = max(len(gt_components), len(gt_reasons), 1)
+
+        # InferenceQuery: fault count from QUERY TEXT only (NOT from GT)
+        text_fault_count = _parse_fault_count_from_text(instruction)
 
         # InferenceQuery: zero GT
         inference_queries.append(InferenceQuery(
@@ -261,12 +290,12 @@ def parse_query_csv(query_csv_path: str) -> Tuple[
             need_time=need_time,
             need_component=need_component,
             need_reason=need_reason,
-            expected_fault_count=expected_fault_count,
+            expected_fault_count=text_fault_count,
         ))
 
-        # EvalTarget: only GT
+        # EvalTarget: only GT (uses GT-derived count for matching)
         root_causes = []
-        for fi in range(expected_fault_count):
+        for fi in range(gt_fault_count):
             comp = gt_components[fi] if fi < len(gt_components) else ""
             dt_str = gt_datetime if fi == 0 else ""
             reason = gt_reasons[fi] if fi < len(gt_reasons) else ""

@@ -65,20 +65,20 @@ SYSTEM_CONFIGS = {
 
 
 def _make_adapter(adapter_cls_name, include_dates):
-    """Create adapter with explicit date set (P0.4: not max_days, but dates)."""
+    """Create adapter with explicit date set (P0.7: include_dates as set[str])."""
     from foundation.adapters import (
         OpenRCABankAdapter, OpenRCATelecomAdapter, OpenRCAMarketAdapter,
     )
     cls_map = {
         "OpenRCABankAdapter": lambda: OpenRCABankAdapter(
-            max_days=len(include_dates) if include_dates else 30,
-            max_container_events=500000, max_container_rows=5000000),
+            max_days=99, max_container_events=500000, max_container_rows=5000000,
+            include_dates=include_dates),
         "OpenRCATelecomAdapter": lambda: OpenRCATelecomAdapter(
-            max_days=len(include_dates) if include_dates else 30,
-            max_container_timestamps=5000),
+            max_days=99, max_container_timestamps=5000,
+            include_dates=include_dates),
         "OpenRCAMarketAdapter": lambda: OpenRCAMarketAdapter(
-            max_days=len(include_dates) if include_dates else 30,
-            max_container_events=500000, max_container_rows=5000000),
+            max_days=99, max_container_events=500000, max_container_rows=5000000,
+            include_dates=include_dates),
     }
     return cls_map[adapter_cls_name]()
 
@@ -234,25 +234,29 @@ def evaluate_system(sys_name, model, state, ob_mean, ob_std, use_posterior,
 
     total_official_queries = len(inference_queries)
 
-    # Compute date range needed from queries
-    all_dates = sorted(set(q.window_start.date() for q in inference_queries))
-    min_date = all_dates[0]
-    max_date = all_dates[-1]
-    print(f"  Query date range: {min_date} — {max_date} ({len(all_dates)} unique dates)")
+    # P0.6: compute date range including burn-in for earliest/latest queries
+    burn_in_td = timedelta(minutes=burn_in_min)
+    min_data_ts = min(q.window_start.timestamp() for q in inference_queries) - burn_in_td.total_seconds()
+    max_data_ts = max(q.window_end.timestamp() for q in inference_queries)
+    min_data_date = datetime.fromtimestamp(min_data_ts, tz=OPENRCA_TZ).date()
+    max_data_date = datetime.fromtimestamp(max_data_ts, tz=OPENRCA_TZ).date()
+    print(f"  Query window range: {inference_queries[0].window_start.date()} "
+          f"— {inference_queries[-1].window_start.date()}")
+    print(f"  Data range (incl burn-in): {min_data_date} — {max_data_date}")
 
-    # P0.4: compute exact date directories needed
+    # P0.7: compute needed date dirs covering [min_data_date, max_data_date]
     telemetry_dir = os.path.join(data_dir, "telemetry")
     available_dates = sorted([d for d in os.listdir(telemetry_dir)
                               if d.startswith("20")]) if os.path.exists(telemetry_dir) else []
-    min_date_str = min_date.strftime("%Y_%m_%d")
-    max_date_str = max_date.strftime("%Y_%m_%d")
-    needed_dates = [d for d in available_dates
-                    if min_date_str <= d <= max_date_str]
+    min_date_str = min_data_date.strftime("%Y_%m_%d")
+    max_date_str = max_data_date.strftime("%Y_%m_%d")
+    needed_dates_set = set(d for d in available_dates
+                           if min_date_str <= d <= max_date_str)
     print(f"  Available telemetry dates: {len(available_dates)}; "
-          f"needed range: {len(needed_dates)}")
+          f"needed: {len(needed_dates_set)} ({sorted(needed_dates_set)[:3]}...)")
 
-    # P0.4: pass needed_dates to adapter
-    adapter = _make_adapter(cfg["adapter_cls"], needed_dates)
+    # P0.7: pass needed_dates as set to adapter
+    adapter = _make_adapter(cfg["adapter_cls"], needed_dates_set)
     all_entities = adapter.discover_entities(data_dir)
     cont_entities = [e for e in all_entities
                      if e.entity_type.value in ("container", "service")]
@@ -388,39 +392,87 @@ def evaluate_system(sys_name, model, state, ob_mean, ob_std, use_posterior,
             skipped_no_label += 1
             continue
 
-        # Evaluate per root cause
+        # P0.7: use NMS to decode multiple fault predictions from single S[t,c]
+        requested_faults = iq.expected_fault_count
+        gt_fault_count = len(eval_tgt.root_causes)
+        min_time_dist = max(3, (5 * 60) // resample_sec)  # min 5min between faults
+        predictions = joint.decode_multiple_faults(
+            max_faults=max(requested_faults, gt_fault_count),
+            min_time_distance=min_time_dist,
+        )
+
+        # Greedy one-to-one matching: predictions to GT labels
         for rc_idx, lb in enumerate(matched_labels):
             if rc_idx >= len(eval_tgt.root_causes):
                 break
             _, _, _, tolerance = eval_tgt.root_causes[rc_idx]
+            gt_c_idx = lb["component_idx"]
+            gt_ts = lb["timestamp"]
+
+            # Find closest prediction to this GT (or use the N-th prediction)
+            if rc_idx < len(predictions):
+                pred_t, pred_c, pred_score = predictions[rc_idx]
+            else:
+                # Fallback to single best (top component, top time)
+                pred_t = int(np.argmax(joint.onset_score))
+                pred_c = int(np.argmax(joint.component_score))
+                pred_score = 0.0
+
+            # Component rank
+            comp_rank = int(np.sum(joint.component_score > joint.component_score[gt_c_idx])) + 1
+            comp_rank = min(comp_rank, N)
+
+            # Time error
+            gt_t_idx = int(np.argmin(np.abs(ts_sub - gt_ts))) if len(ts_sub) > 0 else 0
+            time_error_steps = abs(pred_t - gt_t_idx)
+            time_error_min = time_error_steps * resample_sec / 60.0
+
             tolerance_steps = max(1, (tolerance * 60) // resample_sec)
-            metric = evaluate_joint(
-                joint=joint,
-                gt_component_idx=lb["component_idx"],
-                gt_onset_ts=lb["timestamp"],
-                timestamps=ts_sub,
-                onset_tolerance_steps=tolerance_steps,
-            )
-            # Convert step error to minutes
-            metric["time_error_min"] = metric["time_error"] * resample_sec / 60.0
-            metric["query_window_coverage"] = qw_cov_pct
-            query_results.append(metric)
+            time_hit = time_error_steps <= tolerance_steps
+            comp_hit = pred_c == gt_c_idx
+            joint_hit = comp_hit and time_hit
+
+            query_results.append({
+                "component_rank": comp_rank,
+                "component_top1": comp_rank == 1,
+                "component_top3": comp_rank <= 3,
+                "time_error": time_error_steps,
+                "time_error_min": time_error_min,
+                "time_hit": time_hit,
+                "time_hit_5min": time_error_min <= 5.0,
+                "time_hit_10min": time_error_min <= 10.0,
+                "time_hit_15min": time_error_min <= 15.0,
+                "joint_component_hit": comp_hit,
+                "joint_time_hit": time_hit,
+                "joint_hit": joint_hit,
+                "reciprocal_rank": 1.0 / max(1, comp_rank),
+                "num_faults_in_query": gt_fault_count,
+                "query_window_coverage": qw_cov_pct,
+            })
         processed += 1
 
         if (qi + 1) % 30 == 0:
             print(f"    {qi + 1}/{len(inference_queries)} queries... "
                   f"(avg inf: {total_time/max(1,processed):.2f}s)")
 
+    num_root_causes = len(query_results)
     skipped = skipped_no_data + skipped_no_label
-    print(f"  Official queries: {total_official_queries} | Evaluated: {processed} | "
-          f"Skipped: {skipped} (no_data: {skipped_no_data}, no_label: {skipped_no_label})")
+    print(f"  Official queries: {total_official_queries} | "
+          f"Evaluated queries: {processed} | "
+          f"Total root-causes: {num_root_causes} | "
+          f"Skipped queries: {skipped} (no_data: {skipped_no_data}, no_label: {skipped_no_label})")
     if processed > 0:
         print(f"  Avg inference: {total_time/processed:.2f}s | "
-              f"Time MAE in min: {resample_sec/60.0}s per step")
+              f"Resample: {resample_sec}s per step")
+
+    agg = aggregate_metrics(query_results)
 
     agg = aggregate_metrics(query_results)
     agg["total_official"] = total_official_queries
-    agg["skipped"] = skipped
+    agg["n_queries_evaluated"] = processed
+    agg["n_queries_skipped"] = skipped
+    agg["n_queries_skipped_no_data"] = skipped_no_data
+    agg["n_queries_skipped_no_label"] = skipped_no_label
     return agg
 
 
@@ -497,35 +549,39 @@ def main():
         all_results[sys_name] = agg
         print(f"  Total time: {elapsed:.1f}s")
 
-    print(f"\n{'='*80}")
+    print(f"\n{'='*100}")
     print(f"RESULTS ({mode_str}, {args.method}, {type_str} type)")
-    print(f"{'='*80}")
-    header = (f"{'System':<18s} {'Comp T1':>8s} {'Comp T3':>8s} "
-              f"{'MRR':>8s} {'AvgR':>6s} {'TimeH5':>7s} "
-              f"{'MAEmin':>7s} {'JntHit':>7s} {'Ev/N':>8s}")
+    print(f"{'='*100}")
+    header = (f"{'System':<18s} {'T1':>6s} {'T3':>6s} {'MRR':>7s} "
+              f"{'H@5m':>6s} {'H@10m':>6s} {'H@15m':>6s} "
+              f"{'MAEmin':>7s} {'Jnt':>5s} {'#root':>6s} {'#q':>5s}")
     print(header)
-    print("-" * 80)
+    print("-" * 100)
     for sys_name in args.systems:
         if sys_name not in all_results:
             continue
         r = all_results[sys_name]
         if r.get("n", 0) == 0:
-            print(f"{sys_name:<18s} {'--':>8s} {'--':>8s} "
-                  f"{'--':>8s} {'--':>6s} {'--':>7s} {'--':>7s} {'--':>7s} "
-                  f"{'0/0':>8s}")
+            print(f"{sys_name:<18s} {'--':>6s} {'--':>6s} {'--':>7s} "
+                  f"{'--':>6s} {'--':>6s} {'--':>6s} {'--':>7s} {'--':>5s} "
+                  f"{'0':>6s} {'0':>5s}")
             continue
-        time_mae_min = r.get('time_mae', 0) * args.resample_sec / 60.0
-        total = r.get('total_official', 0)
-        skipped = r.get('skipped', 0)
+        time_mae_min = r.get('time_mae_min', r.get('time_mae', 0) * args.resample_sec / 60.0)
+        total_q = r.get('total_official', 0)
+        n_q_eval = r.get('n_queries_evaluated', r.get('n', 0))
         print(f"{sys_name:<18s} "
-              f"{r['component_top1']:>7.1%} {r['component_top3']:>7.1%} "
-              f"{r['mrr']:>8.3f} {r['avg_rank']:>6.2f} "
-              f"{r['time_hit_rate']:>7.1%} {time_mae_min:>7.1f} "
-              f"{r['joint_hit_rate']:>7.1%} "
-              f"{r['n']:>4d}/{total:>4d}")
-    print("-" * 80)
-    print(f"Time MAE in minutes (resample={args.resample_sec}s). "
-          f"TimeHit@5min for tolerance=3 steps.")
+              f"{r['component_top1']:>5.1%} {r['component_top3']:>5.1%} "
+              f"{r['mrr']:>7.3f} "
+              f"{r.get('time_hit_5min', 0):>5.1%} "
+              f"{r.get('time_hit_10min', 0):>5.1%} "
+              f"{r.get('time_hit_15min', 0):>5.1%} "
+              f"{time_mae_min:>7.1f} "
+              f"{r['joint_hit_rate']:>4.1%} "
+              f"{r['n']:>6d} "
+              f"{total_q:>5d}")
+    print("-" * 100)
+    print(f"Legend: T1=Top-1, T3=Top-3, H@5m=Hit@5min, Jnt=Joint Hit, "
+          f"#root=root-cause instances, #q=official queries")
     print(f"\nDone. Mode: {mode_str} | Method: {args.method} | Type: {type_str}")
 
 

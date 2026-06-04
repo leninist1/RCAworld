@@ -541,12 +541,14 @@ def evaluate_joint(
 
 
 def aggregate_metrics(results: List[Dict]) -> Dict:
-    """Aggregate per-query metrics into summary statistics."""
+    """Aggregate per-root-cause metrics into summary statistics."""
     n = len(results)
     if n == 0:
         return {"n": 0}
 
-    return {
+    total_queries = len(set(r.get("num_faults_in_query", 0) for r in results))
+    # sum num_faults is not correct — just aggregate available fields
+    agg = {
         "n": n,
         "component_top1": np.mean([r["component_top1"] for r in results]),
         "component_top3": np.mean([r["component_top3"] for r in results]),
@@ -554,7 +556,12 @@ def aggregate_metrics(results: List[Dict]) -> Dict:
         "avg_rank": np.mean([r["component_rank"] for r in results]),
         "time_hit_rate": np.mean([r["time_hit"] for r in results]),
         "time_mae": np.mean([r["time_error"] for r in results]),
+        "time_mae_min": np.mean([r.get("time_error_min", r.get("time_error", 0) * 2) for r in results]),
+        "time_hit_5min": np.mean([r.get("time_hit_5min", False) for r in results]),
+        "time_hit_10min": np.mean([r.get("time_hit_10min", False) for r in results]),
+        "time_hit_15min": np.mean([r.get("time_hit_15min", False) for r in results]),
         "joint_hit_rate": np.mean([r["joint_hit"] for r in results]),
         "joint_component_hit": np.mean([r["joint_component_hit"] for r in results]),
         "joint_time_hit": np.mean([r["joint_time_hit"] for r in results]),
     }
+    return agg

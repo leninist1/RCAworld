@@ -13,7 +13,7 @@ Entity model:
 import os
 import re
 from collections import defaultdict
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Set
 from glob import glob
 
 import numpy as np
@@ -82,18 +82,22 @@ class OpenRCABankAdapter(BaseAdapter):
     }
 
     def __init__(self, max_days: int = 5, max_container_timestamps: int = 5000,
-                 max_container_events: int = 50000, max_container_rows: int = 300000):
+                 max_container_events: int = 50000, max_container_rows: int = 300000,
+                 include_dates: Optional[Set[str]] = None):
         self.max_days = max_days
         self.max_container_timestamps = max_container_timestamps
         self.max_container_events = max_container_events
         self.max_container_rows = max_container_rows
+        self.include_dates = include_dates  # if set, only load these date dirs
 
     def _get_days(self, data_dir: str) -> List[str]:
         telemetry_dir = os.path.join(data_dir, "telemetry")
         if not os.path.exists(telemetry_dir):
             return []
         days = sorted([d for d in os.listdir(telemetry_dir)
-                       if d.startswith("20")])
+                        if d.startswith("20")])
+        if self.include_dates is not None:
+            days = [d for d in days if d in self.include_dates]
         return days[:self.max_days]
 
     def _map_kpi_to_category(self, kpi_name: str) -> Optional[str]:
