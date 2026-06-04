@@ -206,49 +206,36 @@
 > 此前报告 24.3% Top-1 含 GT-component 泄露（先读 rc 再选 window 峰值）
 > 当前 0.7% 是可信的无泄露严格零样本基线
 
-### Phase A-Hardening P0.5: Query Episode Protocol 🟩
+### Phase A-Hardening P0.6: GT Isolation + Time Hit Fix 🟩
 
-**核心修复** (2026-06-04):
+**核心修复** (commit `b2b566c`, 2026-06-04):
 
-| # | 问题 | 修复 | 文件 |
-|---|------|------|------|
-| 1 | 评估是全局 S[t,c] 与全部标签比较，不是逐查询 Episode | 每条 query.csv → 独立 Episode + 独立 S[t,c] 推断 | `scripts/phaseA_strict_eval.py` |
-| 2 | 未使用 query.csv，只读 record.csv | 新增 `query_parser.py` 解析观测窗口 + `episode_builder.py` 按窗口构造切片 | `evaluation/query_parser.py`, `evaluation/episode_builder.py` |
-| 3 | max_days=1 只加载第一天，却评估全量标签 | 从查询窗口自动计算需要的日期数；验证标签在遥测范围内 | `evaluation/leakage_checks.py` |
-| 4 | Market 未使用 MarketAdapter | ADAPTERS 字典明确定义 Bank/Market-cloudbed-1/2/Telecom | `scripts/phaseA_strict_eval.py` |
-| 5 | per-entity max 归一化破坏跨组件排序 | 新增 cross-entity calibrated scoring: MAD z-score (`(x-median)/MAD`) | `evaluation/strict_eval.py` |
-| 6 | obs_mask 硬编码所有实体有 8 个指标 | 从实际 counts 构造 obs_mask | `evaluation/episode_builder.py` |
-| 7 | 时间轴无固定重采样 | 按 --resample_sec 参数固定网格重采样 | `evaluation/episode_builder.py` |
-| 8 | 重叠窗口 residual 覆盖而非平均 | residual_accum + residual_count 取均值 | `scripts/phaseA_strict_eval.py` |
-| 9 | `diagnose()` 硬编码 posterior | 默认改为 prior-only，新增参数控制 | `models/world_model.py` |
-| 10 | 文档未区分 heuristic scoring 与 learned heads | 明确标注 Methods A-E，仅 B/C 当前可用 | `evaluation/strict_eval.py` |
+| # | 问题 | 修复 |
+|---|------|------|
+| P0.1 | InferenceQuery 与 GT 在同一数据结构中 | `InferenceQuery` (无GT) 与 `EvalTarget` (仅GT) 完全隔离 |
+| P0.2 | Time Hit 可能在 burn-in 区间取峰值 | `onset_score` 使用 query_window_mask 约束在查询窗口内 |
+| P0.3 | 多故障 Query 被错误拆分为多个独立 Episode | 单窗口一次 Episode + NMS 解码多峰 |
+| P0.4 | Adapter 加载"前N天"而非查询需要的日期 | 从 query 日期范围自动计算 needed_dates |
+| P1.1 | naive datetime 无时区 | 全局 UTC+8 (Asia/Shanghai)，跨午夜处理 |
+| P1.4 | 滑动窗口尾部可能未覆盖 | 始终补上最后一个窗口 + 返回 coverage_mask |
 
-**新增文件**:
-| 文件 | 用途 |
+**关键代码变更**:
+| 文件 | 变更 |
 |------|------|
-| `src/foundation/evaluation/query_parser.py` | 解析 query.csv 提取观测窗口 + 请求字段 + GT 答案 |
-| `src/foundation/evaluation/episode_builder.py` | 按查询窗口构建 Episode 张量 + obs_mask + 固定时间网格 |
-| `src/foundation/evaluation/leakage_checks.py` | 验证标签在遥测范围内、查询窗口包含 GT 时间等 |
+| `query_parser.py` | 拆分为 `InferenceQuery`（零GT）+ `EvalTarget`（仅GT）；返回 `(List[InferenceQuery], Dict[int, EvalTarget])` |
+| `strict_eval.py` | `onset_score` 属性加入 query_window_mask；新增 `decode_multiple_faults()` NMS 函数 |
+| `episode_builder.py` | `build_episode()` 只接受 `InferenceQuery`（移除所有 GT 字段引用） |
+| `phaseA_strict_eval.py` | 推理路径只接触 InferenceQuery；评估路径只读取 EvalTarget + record.csv |
 
-**P0.5 实验矩阵** (Bank, prior-only, 144 queries evaluated):
+**P0.6 实验结果** (Bank, prior-only, calibrated, 30min burn-in, 120s resample):
 
-| 实验 | 方法 | 类型 | Comp T1 | Comp T3 | MRR | TimeHit | TimeMAE | JointHit |
-|------|------|------|---------|---------|-----|---------|---------|----------|
-| B0 | residual_only (calibrated) | all-zero | 1.4% | 14.6% | 0.175 | 9.0% | 9.9 | 0.0% |
-| B1 | residual+shift+early-rise (calibrated) | all-zero | 2.8% | 13.9% | 0.182 | 13.2% | 8.3 | 0.7% |
-| B2 | calibrated (同上) | heuristic | 3.5% | 15.3% | 0.186 | 10.4% | 7.7 | 0.7% |
-| Legacy | per-entity max (OLD) | all-zero | 7.6% | 18.1% | 0.221 | 18.1% | 4.9 | 2.1% |
+| 方法 | Comp T1 | Comp T3 | MRR | TimeH5 | MAE(min) | JntHit | Ev/Official |
+|------|---------|---------|-----|--------|----------|--------|-------------|
+| calibrated (all-zero) | 6.6% | 24.8% | 0.232 | 9.9% | 20.3 | 0.0% | 121/131 |
 
-**Market/cloudbed-1** (calibrated, all-zero, 79 queries):
-| Comp T1 | Comp T3 | MRR | TimeHit | JointHit |
-|---------|---------|-----|---------|----------|
-| 6.3% | 8.9% | 0.136 | 15.2% | 5.1% |
+> **注**: Time Hit 从 P0.5 的 13.2% 降到 9.9%，原因是现在 onset_score 被正确约束在查询窗口内（而非全时间轴）。Time MAE = 20.3分钟。22 条 query 因未匹配到 record.csv label 被跳过。
 
-> **注**: `legacy_per_entity_max` 方法分数更高是因为每个实体对自己的峰值归一化后都接近1，消去了跨实体比较信息。calibrated MAD z-score 更能反映真实异常显著度，但当前 burn-in 窗口可能包含相邻故障，导致正常基线估计不准确。
-
-> **Telecom**: 当前 adapter 时间戳处理存在 ms/s 混淆，大部分 container 事件时间戳越界。已添加 timestamp sanity filter 到 episode_builder，但 Telecom 仍需 adapter 级修复。
-
-### 下一优先级: Learned Onset Head 参与 strict eval → synthetic perturbation onset supervision 🟦
+### 下一优先级: Learned Onset Head 参与 strict eval 🟦
 
 ---
 
