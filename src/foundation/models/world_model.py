@@ -157,9 +157,9 @@ class RCAWorldFoundation(nn.Module):
         return result
 
     def diagnose(self, x, type_idx, rng, obs_mask=None, edge_index=None,
-                 ctx_seq=None):
+                 ctx_seq=None, use_posterior: bool = False):
         out = self(x, type_idx, rng, obs_mask, edge_index, ctx_seq,
-                   use_posterior=True)
+                   use_posterior=use_posterior)
         diagnosis = {"residual": out["residual"]}
 
         if "onset" in out:
