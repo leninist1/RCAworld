@@ -76,8 +76,15 @@ class JointScores:
 
     @property
     def onset_score(self) -> np.ndarray:
-        """Marginal: p(t | O) = sum_c S[t,c]."""
-        return self.S.sum(axis=1)  # [T]
+        """Marginal: p(t | O) = sum_c S[t,c] inside query window.
+
+        FIXED: time predictions are now constrained to the query observation
+        window only. Burn-in timesteps are masked to -inf.
+        """
+        scores = self.S.sum(axis=1)  # [T]
+        if self.query_window_mask is not None:
+            scores = np.where(self.query_window_mask, scores, -np.inf)
+        return scores
 
     @property
     def top_component(self) -> int:
@@ -98,6 +105,40 @@ class JointScores:
             idx = int(np.argmax(self.S))
         T, N = self.S.shape
         return (idx // N, idx % N)
+
+    def decode_multiple_faults(self, max_faults: int = 1,
+                                min_time_distance: int = 5) -> List[Tuple[int, int, float]]:
+        """Decode multiple fault predictions with Non-Maximum Suppression.
+
+        For multi-fault queries, returns a list of (t, c, score) tuples,
+        each being a local maximum after suppressing previous peaks.
+
+        Args:
+            max_faults: Maximum number of faults to return.
+            min_time_distance: Minimum timestep distance between faults.
+
+        Returns:
+            List of (time_idx, component_idx, score) sorted by time.
+        """
+        S = self.S.copy()
+        if self.query_window_mask is not None:
+            S[~self.query_window_mask] = -np.inf
+
+        candidates = []
+        for _ in range(max_faults):
+            idx = int(np.argmax(S))
+            score = S.flat[idx]
+            if not np.isfinite(score) or score <= 0:
+                break
+            t, c = idx // S.shape[1], idx % S.shape[1]
+            candidates.append((t, c, float(score)))
+
+            # Suppress nearby time region
+            left = max(0, t - min_time_distance)
+            right = min(S.shape[0], t + min_time_distance + 1)
+            S[left:right, :] = -np.inf
+
+        return sorted(candidates, key=lambda x: x[0])
 
 
 # ═══════════════════════════════════════════════════════════════════════

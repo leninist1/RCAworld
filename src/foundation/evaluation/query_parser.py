@@ -1,45 +1,56 @@
 """Query parser for OpenRCA query.csv format.
 
-Parses natural-language queries to extract:
-  - Observation window (date + time range), usable for telemetry loading.
-  - Requested output fields (time, component, reason) from task_index.
-  - Ground-truth scoring points (ONLY for evaluation, must NOT leak to model).
+Strict GT isolation:
+  - InferenceQuery: only query metadata + observation window. NEVER contains GT.
+  - EvalTarget: ground-truth answers for evaluation ONLY. NEVER passed to model.
 
-Each query becomes an independent Episode in the strict evaluation protocol.
+These two data classes must remain in physically separate code paths:
+  - run_inference.py imports InferenceQuery, NEVER EvalTarget.
+  - evaluate_predictions.py imports EvalTarget, reads record.csv.
+
+UTC+8 timezone handling:
+  OpenRCA official: all fault times in UTC+8 (Asia/Shanghai).
+  Telemetry timestamps may also need conversion; adapter handles per-system.
 """
 
 import re
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
+OPENRCA_TZ = ZoneInfo("Asia/Shanghai")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# InferenceQuery: visible to model inference (NO GT)
+# ═══════════════════════════════════════════════════════════════════════
 
 @dataclass
-class ParsedQuery:
-    """A single OpenRCA query, parsed into machine-usable fields.
+class InferenceQuery:
+    """Query metadata for model inference — ZERO ground truth.
+
+    This is the ONLY query object that should be visible to:
+      - telemetry loading
+      - episode building
+      - model forward pass
+      - joint scoring
+      - prediction generation
 
     Attributes:
         query_id: Unique query identifier (row index in query.csv).
-        task_index: Task type string (task_1 .. task_7).
         instruction: Raw natural-language instruction text.
-        window_start: Observation window start (datetime).
-        window_end: Observation window end (datetime).
-        need_time: Whether occurrence time is requested.
+        window_start: Observation window start (UTC+8 aware datetime).
+        window_end: Observation window end (UTC+8 aware datetime).
+        need_time: Whether occurrence time is requested (from task_index).
         need_component: Whether root-cause component is requested.
         need_reason: Whether failure reason is requested.
-        expected_fault_count: How many faults the query expects.
-
-        # Ground truth (ONLY for evaluation — must NOT be read during inference):
-        gt_datetime: Ground-truth occurrence datetime string (e.g., "2021-03-04 14:57:00").
-        gt_component: Ground-truth root cause component name.
-        gt_reason: Ground-truth failure reason.
-        gt_tolerance_min: Time tolerance in minutes for exact match.
+        expected_fault_count: How many faults to predict (from query text).
     """
 
     query_id: int
-    task_index: str
     instruction: str
     window_start: datetime
     window_end: datetime
@@ -48,14 +59,37 @@ class ParsedQuery:
     need_reason: bool = True
     expected_fault_count: int = 1
 
-    # Ground truth (hidden from model)
-    gt_datetime: str = ""
-    gt_component: str = ""
-    gt_reason: str = ""
-    gt_tolerance_min: int = 1
+
+# ═══════════════════════════════════════════════════════════════════════
+# EvalTarget: ground-truth answers for evaluation ONLY
+# ═══════════════════════════════════════════════════════════════════════
+
+@dataclass
+class EvalTarget:
+    """Ground-truth answers for one query — evaluation ONLY.
+
+    This object MUST NEVER be visible to model inference, episode builder,
+    or any code path that touches telemetry or model forward pass.
+
+    Attributes:
+        query_id: Matches InferenceQuery.query_id.
+        root_causes: List of (component, datetime, reason, tolerance_min) tuples.
+        need_time: Which fields were asked (used for exact match scoring).
+        need_component: See above.
+        need_reason: See above.
+    """
+
+    query_id: int
+    root_causes: List[Tuple[str, str, str, int]] = field(default_factory=list)
+    need_time: bool = True
+    need_component: bool = True
+    need_reason: bool = True
 
 
-# Mapping from task_index to requested output fields
+# ═══════════════════════════════════════════════════════════════════════
+# Task field mapping
+# ═══════════════════════════════════════════════════════════════════════
+
 TASK_FIELD_MAP: Dict[str, Dict[str, bool]] = {
     "task_1": {"need_time": True, "need_component": False, "need_reason": False},
     "task_2": {"need_time": False, "need_component": False, "need_reason": True},
@@ -66,39 +100,27 @@ TASK_FIELD_MAP: Dict[str, Dict[str, bool]] = {
     "task_7": {"need_time": True, "need_component": True, "need_reason": True},
 }
 
-# Regex patterns for parsing instruction text
-# Matches: "March 4, 2021"  or  "March 20, 2022"  or  "April 11, 2020"  or  "May 22, 2020"
+# Regex patterns
 _DATE_PATTERN = re.compile(
     r'(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2}),?\s+(\d{4})',
     re.IGNORECASE,
 )
-
-# Matches: "from 14:30 to 15:00"  or  "between 09:00 and 09:30"  or  "from 00:30 to 01:00"
 _TIME_RANGE_PATTERN = re.compile(
     r'(?:from|between)\s+(\d{1,2}):(\d{2})\s+(?:to|and)\s+(\d{1,2}):(\d{2})',
     re.IGNORECASE,
 )
-
-# Parse ground truth from scoring_points column
-# "The only root cause occurrence time is within 1 minutes (i.e., <=1min) of 2021-03-04 14:57:00"
 _GT_TIME_PATTERN = re.compile(
     r'root cause occurrence time is within\s+(\d+)\s+minutes.*?of\s+(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})',
     re.IGNORECASE,
 )
-
-# "The only predicted root cause component is Redis02"
 _GT_COMPONENT_PATTERN = re.compile(
     r'(?:The\s+[\d]+-th\s+)?predicted root cause component is\s+([^\n\r]+)',
     re.IGNORECASE,
 )
-
-# "The only predicted root cause reason is high memory usage"
 _GT_REASON_PATTERN = re.compile(
     r'(?:The\s+[\d]+-th\s+)?predicted root cause reason is\s+([^\n\r]+)',
     re.IGNORECASE,
 )
-
-# For multi-fault queries (e.g., "The 1-th predicted root cause component is...")
 _MULTI_COMPONENT_PATTERN = re.compile(
     r'The\s+(\d+)-th\s+predicted root cause component is\s+([^\n\r]+)',
     re.IGNORECASE,
@@ -107,8 +129,6 @@ _MULTI_REASON_PATTERN = re.compile(
     r'The\s+(\d+)-th\s+predicted root cause reason is\s+([^\n\r]+)',
     re.IGNORECASE,
 )
-
-# Month name to number
 _MONTH_MAP = {
     "january": 1, "february": 2, "march": 3, "april": 4,
     "may": 5, "june": 6, "july": 7, "august": 8,
@@ -116,8 +136,16 @@ _MONTH_MAP = {
 }
 
 
+def _make_utc8_dt(year: int, month: int, day: int,
+                   hour: int = 0, minute: int = 0,
+                   second: int = 0) -> datetime:
+    """Create a UTC+8 aware datetime."""
+    return datetime(year, month, day, hour, minute, second,
+                    tzinfo=OPENRCA_TZ)
+
+
 def parse_date_from_text(text: str) -> Optional[datetime]:
-    """Extract date from instruction text (returns date with time set to 00:00)."""
+    """Extract date from instruction text (returns UTC+8 aware datetime at 00:00)."""
     m = _DATE_PATTERN.search(text)
     if not m:
         return None
@@ -126,7 +154,7 @@ def parse_date_from_text(text: str) -> Optional[datetime]:
     year = int(m.group(3))
     if month is None:
         return None
-    return datetime(year, month, day)
+    return _make_utc8_dt(year, month, day)
 
 
 def parse_time_range_from_text(text: str) -> Optional[Tuple[int, int, int, int]]:
@@ -137,16 +165,14 @@ def parse_time_range_from_text(text: str) -> Optional[Tuple[int, int, int, int]]
     return int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4))
 
 
-def parse_gt_time(scoring_points: str) -> Tuple[str, int]:
-    """Extract ground-truth datetime and tolerance (minutes) from scoring_points."""
+def _parse_gt_time(scoring_points: str) -> Tuple[str, int]:
     m = _GT_TIME_PATTERN.search(scoring_points)
     if m:
         return m.group(2), int(m.group(1))
     return "", 1
 
 
-def parse_gt_components(scoring_points: str) -> List[str]:
-    """Extract ground-truth components from scoring_points (supports multi-fault)."""
+def _parse_gt_components(scoring_points: str) -> List[str]:
     components = []
     for m in _MULTI_COMPONENT_PATTERN.finditer(scoring_points):
         components.append(m.group(2).strip())
@@ -157,8 +183,7 @@ def parse_gt_components(scoring_points: str) -> List[str]:
     return components
 
 
-def parse_gt_reasons(scoring_points: str) -> List[str]:
-    """Extract ground-truth reasons from scoring_points (supports multi-fault)."""
+def _parse_gt_reasons(scoring_points: str) -> List[str]:
     reasons = []
     for m in _MULTI_REASON_PATTERN.finditer(scoring_points):
         reasons.append(m.group(2).strip())
@@ -169,76 +194,96 @@ def parse_gt_reasons(scoring_points: str) -> List[str]:
     return reasons
 
 
-def parse_query_csv(query_csv_path: str) -> List[ParsedQuery]:
-    """Parse OpenRCA query.csv into a list of structured ParsedQuery objects.
+# ═══════════════════════════════════════════════════════════════════════
+# Main parse: returns separated InferenceQuery + EvalTarget
+# ═══════════════════════════════════════════════════════════════════════
 
-    Each row in query.csv contains:
-      - task_index: task type (task_1 .. task_7)
-      - instruction: natural language query with observation window
-      - scoring_points: ground truth answers (hidden from model)
+def parse_query_csv(query_csv_path: str) -> Tuple[
+        List[InferenceQuery], Dict[int, EvalTarget]]:
+    """Parse OpenRCA query.csv into GT-isolated InferenceQuery and EvalTarget.
+
+    InferenceQuery objects contain ONLY observation metadata:
+      - query_id, instruction, window_start, window_end
+      - need_time / need_component / need_reason (from task_index)
+      - expected_fault_count
+
+    EvalTarget objects contain ONLY ground truth (for evaluation):
+      - List of (component, datetime, reason, tolerance_min) tuples
+
+    These two types must NEVER be passed to the same function.
+    Inference code imports InferenceQuery ONLY.
+    Evaluation code imports EvalTarget + reads record.csv.
 
     Returns:
-        List of ParsedQuery objects, one per query row.
+        (inference_queries, eval_targets_by_id)
+          inference_queries: one per query row (not per fault).
+          eval_targets_by_id: dict keyed by query_id.
     """
     df = pd.read_csv(query_csv_path)
-    queries: List[ParsedQuery] = []
+    inference_queries: List[InferenceQuery] = []
+    eval_targets: Dict[int, EvalTarget] = {}
 
     for idx, row in df.iterrows():
         task = str(row.get("task_index", ""))
         instruction = str(row.get("instruction", ""))
         scoring = str(row.get("scoring_points", ""))
 
-        # Parse observation window
         date = parse_date_from_text(instruction)
         time_range = parse_time_range_from_text(instruction)
-
         if date is None or time_range is None:
             continue
 
         sh, sm, eh, em = time_range
-        window_start = date.replace(hour=sh, minute=sm, second=0, microsecond=0)
-        window_end = date.replace(hour=eh, minute=em, second=0, microsecond=0)
+        window_start = _make_utc8_dt(date.year, date.month, date.day, sh, sm)
+        window_end = _make_utc8_dt(date.year, date.month, date.day, eh, em)
 
-        # Parse requested fields from task_index
+        # Handle cross-midnight: if window_end <= window_start, it wraps to next day
+        if window_end <= window_start:
+            window_end += timedelta(days=1)
+
         fields = TASK_FIELD_MAP.get(task, {})
         need_time = fields.get("need_time", True)
         need_component = fields.get("need_component", True)
         need_reason = fields.get("need_reason", True)
 
-        # Parse ground truth (only for evaluation)
-        gt_datetime, gt_tolerance = parse_gt_time(scoring)
-        gt_components = parse_gt_components(scoring)
-        gt_reasons = parse_gt_reasons(scoring)
+        # Parse GT from scoring_points (hidden)
+        gt_datetime, gt_tolerance = _parse_gt_time(scoring)
+        gt_components = _parse_gt_components(scoring)
+        gt_reasons = _parse_gt_reasons(scoring)
         expected_fault_count = max(len(gt_components), len(gt_reasons), 1)
 
-        # Each query row may contain multiple faults; create one ParsedQuery per fault
-        # for simpler evaluation loop
-        for fi in range(expected_fault_count):
-            queries.append(ParsedQuery(
-                query_id=idx,
-                task_index=task,
-                instruction=instruction,
-                window_start=window_start,
-                window_end=window_end,
-                need_time=need_time,
-                need_component=need_component,
-                need_reason=need_reason,
-                expected_fault_count=expected_fault_count,
-                gt_datetime=gt_datetime if fi == 0 else "",
-                gt_component=(gt_components[fi] if fi < len(gt_components) else ""),
-                gt_reason=(gt_reasons[fi] if fi < len(gt_reasons) else ""),
-                gt_tolerance_min=gt_tolerance,
-            ))
+        # InferenceQuery: zero GT
+        inference_queries.append(InferenceQuery(
+            query_id=idx,
+            instruction=instruction,
+            window_start=window_start,
+            window_end=window_end,
+            need_time=need_time,
+            need_component=need_component,
+            need_reason=need_reason,
+            expected_fault_count=expected_fault_count,
+        ))
 
-    return queries
+        # EvalTarget: only GT
+        root_causes = []
+        for fi in range(expected_fault_count):
+            comp = gt_components[fi] if fi < len(gt_components) else ""
+            dt_str = gt_datetime if fi == 0 else ""
+            reason = gt_reasons[fi] if fi < len(gt_reasons) else ""
+            root_causes.append((comp, dt_str, reason, gt_tolerance))
+        eval_targets[idx] = EvalTarget(
+            query_id=idx,
+            root_causes=root_causes,
+            need_time=need_time,
+            need_component=need_component,
+            need_reason=need_reason,
+        )
+
+    return inference_queries, eval_targets
 
 
 def format_episode_window(window_start: datetime,
                            window_end: datetime,
                            burn_in_min: int = 60) -> Tuple[datetime, datetime]:
-    """Return (data_start, data_end) including burn-in period before window.
-
-    The burn_in period allows the RSSM to build context before the query window.
-    It is part of model input but NOT part of the query's observation window.
-    """
+    """Return (data_start, data_end) including burn-in period before window."""
     return window_start - timedelta(minutes=burn_in_min), window_end

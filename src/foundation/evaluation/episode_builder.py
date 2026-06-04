@@ -1,14 +1,14 @@
 """Episode builder for query-level OpenRCA evaluation.
 
-For each ParsedQuery, builds an independent Episode tensor with:
+For each InferenceQuery, builds an independent Episode tensor with:
   - Only telemetry within the query's observation window (+ burn-in).
   - Real observation mask from actual KPI availability.
   - Fixed-time-grid resampling (optional, default 60s).
   - Entity type assignments (heuristic or learned).
 
-GT labels are attached only for evaluation — the model never sees them.
+CRITICAL: InferenceQuery contains ZERO ground truth. GT labels are NEVER
+exposed to episode building, telemetry loading, or model inference.
 """
-
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Tuple
 
@@ -16,7 +16,7 @@ import numpy as np
 
 from ..schema.entity import Entity
 from ..schema.event import ObservationEvent
-from .query_parser import ParsedQuery
+from .query_parser import InferenceQuery
 
 
 def assign_entity_type(entity_id: str) -> str:
@@ -165,7 +165,7 @@ def build_telemetry_tensor(
 def build_episode(
     events: List[ObservationEvent],
     all_entities: List[Entity],
-    query: ParsedQuery,
+    query: InferenceQuery,  # NO GT — only observation metadata
     burn_in_min: int = 60,
     resample_interval_sec: int = 60,
     ob_mean: Optional[np.ndarray] = None,
@@ -198,7 +198,7 @@ def build_episode(
             type_idx: [N] integer type indices.
             window_start_ts: float UNIX timestamp of window start.
             window_end_ts: float UNIX timestamp of window end.
-            query: ParsedQuery (reference).
+            query: InferenceQuery (reference, NO GT).
     """
     if type_str_to_idx is None:
         type_str_to_idx = {"container": 0, "database": 1, "middleware": 2, "host": 0}
@@ -274,7 +274,7 @@ def build_episode(
 def build_episodes_for_queries(
     events: List[ObservationEvent],
     all_entities: List[Entity],
-    queries: List[ParsedQuery],
+    queries: List[InferenceQuery],
     burn_in_min: int = 60,
     resample_interval_sec: int = 60,
     ob_mean: Optional[np.ndarray] = None,

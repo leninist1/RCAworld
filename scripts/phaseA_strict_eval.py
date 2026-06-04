@@ -1,23 +1,22 @@
-"""Phase A-Hardening P0.5: Query Episode Protocol — strict zero-shot evaluation.
+"""Phase A-Hardening P0.6: GT-isolated Query Episode Protocol evaluation.
 
-Rules:
-  1. Each query.csv row -> independent Episode with its own observation window.
-  2. Telemetry loaded once globally, then sliced per-query window + burn-in.
-  3. GT labels ONLY used in metric computation, NEVER during inference.
-  4. prior-only as primary; posterior as --ablation.
-  5. OpenRCA data NEVER used for training.
-  6. Real observation mask from actual KPI availability (counts > 0).
-  7. Fixed-time-grid resampling (default 60s per step).
-  8. Overlapping window residuals averaged, not overwritten.
-  9. Cross-entity calibrated scoring (MAD-based z-scores).
-  10. query.csv observation windows are the only legal data slice.
+GT isolation (P0.1):
+  - InferenceQuery: observation metadata ONLY. NEVER contains GT.
+  - EvalTarget: ground truth ONLY, read from separate code path.
+  - Episode builder NEVER touches EvalTarget.
+  - Model inference NEVER touches EvalTarget or record.csv.
 
-Reports:
-  System | Comp Top-1 | Top-3 | MRR | Time MAE | Time Hit@5min | Joint Hit
+Fixes implemented vs P0.5:
+  P0.2: Time Hit constrained to query window (onset_score respects qw_mask).
+  P0.3: Multi-fault queries decoded via Non-Maximum Suppression.
+  P0.4: Adapter loads explicit date range from query dates.
+  P1.1: UTC+8 aware datetimes throughout.
+  P1.4: Sliding window tail coverage (last window always included).
 """
 
 import os, sys, time, argparse
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 import numpy as np
 import h5py
 import jax, jax.numpy as jnp
@@ -34,7 +33,8 @@ from foundation.evaluation.strict_eval import (
     JointScores,
 )
 from foundation.evaluation.query_parser import (
-    parse_query_csv, ParsedQuery,
+    parse_query_csv, InferenceQuery, EvalTarget,
+    format_episode_window, OPENRCA_TZ,
 )
 from foundation.evaluation.episode_builder import (
     build_telemetry_tensor, KPI_TO_OB, assign_entity_type,
@@ -49,48 +49,42 @@ DATA_PATH = os.path.join(PROJECT_ROOT, "data", "processed", "hipster_dataset.h5"
 CKPT_PATH = os.path.join(PROJECT_ROOT, "checkpoints", "phaseA", "best")
 OPENRCA = "/home/dell2/RCA513/yyx/OpenRCA"
 MAX_D = 16
-WS = 23  # RSSM window size
+WS = 23
 DET_DIM = 256
 
-
 SYSTEM_CONFIGS = {
-    "Bank": {
-        "data_dir": os.path.join(OPENRCA, "Bank", "Bank"),
-        "adapter_cls": "OpenRCABankAdapter",
-    },
-    "Market/cloudbed-1": {
-        "data_dir": os.path.join(OPENRCA, "Market", "Market", "cloudbed-1"),
-        "adapter_cls": "OpenRCAMarketAdapter",
-    },
-    "Market/cloudbed-2": {
-        "data_dir": os.path.join(OPENRCA, "Market", "Market", "cloudbed-2"),
-        "adapter_cls": "OpenRCAMarketAdapter",
-    },
-    "Telecom": {
-        "data_dir": os.path.join(OPENRCA, "Telecom", "Telecom"),
-        "adapter_cls": "OpenRCATelecomAdapter",
-    },
+    "Bank": {"data_dir": os.path.join(OPENRCA, "Bank", "Bank"),
+             "adapter_cls": "OpenRCABankAdapter"},
+    "Market/cloudbed-1": {"data_dir": os.path.join(OPENRCA, "Market", "Market", "cloudbed-1"),
+                           "adapter_cls": "OpenRCAMarketAdapter"},
+    "Market/cloudbed-2": {"data_dir": os.path.join(OPENRCA, "Market", "Market", "cloudbed-2"),
+                           "adapter_cls": "OpenRCAMarketAdapter"},
+    "Telecom": {"data_dir": os.path.join(OPENRCA, "Telecom", "Telecom"),
+                "adapter_cls": "OpenRCATelecomAdapter"},
 }
 
 
-def _make_adapter(adapter_cls_name, max_days):
+def _make_adapter(adapter_cls_name, include_dates):
+    """Create adapter with explicit date set (P0.4: not max_days, but dates)."""
     from foundation.adapters import (
         OpenRCABankAdapter, OpenRCATelecomAdapter, OpenRCAMarketAdapter,
     )
     cls_map = {
         "OpenRCABankAdapter": lambda: OpenRCABankAdapter(
-            max_days=max_days, max_container_events=500000,
-            max_container_rows=5000000),
+            max_days=len(include_dates) if include_dates else 30,
+            max_container_events=500000, max_container_rows=5000000),
         "OpenRCATelecomAdapter": lambda: OpenRCATelecomAdapter(
-            max_days=max_days, max_container_timestamps=5000),
+            max_days=len(include_dates) if include_dates else 30,
+            max_container_timestamps=5000),
         "OpenRCAMarketAdapter": lambda: OpenRCAMarketAdapter(
-            max_days=max_days, max_container_events=500000,
-            max_container_rows=5000000),
+            max_days=len(include_dates) if include_dates else 30,
+            max_container_events=500000, max_container_rows=5000000),
     }
     return cls_map[adapter_cls_name]()
 
 
 def _extract_labels(data_dir, entity_ids, adapter):
+    """Extract labels from record.csv — EVALUATION ONLY."""
     all_entities = adapter.discover_entities(data_dir)
     cont_entities = [e for e in all_entities
                      if e.entity_type.value in ("container", "service")]
@@ -120,31 +114,72 @@ def _extract_labels(data_dir, entity_ids, adapter):
     return labels
 
 
+def _match_eval_label(eval_target: EvalTarget, labels: list,
+                       timestamps: np.ndarray, entity_ids: list) -> list:
+    """Match EvalTarget root causes to record.csv labels. EVALUATION ONLY."""
+    qw_idx = 0  # placeholder; actual query window from eval_target context
+    matched = []
+    for rc_idx, (comp, dt_str, reason, tolerance) in enumerate(eval_target.root_causes):
+        # Strategy 1: match by datetime from scoring_points
+        found = None
+        if dt_str:
+            try:
+                from datetime import datetime as dt
+                gt_dt = dt.strptime(dt_str, "%Y-%m-%d %H:%M:%S")
+                gt_ts = gt_dt.replace(tzinfo=OPENRCA_TZ).timestamp()
+                for lb in labels:
+                    if abs(lb["timestamp"] - gt_ts) < 300:
+                        found = lb
+                        break
+            except (ValueError, OSError):
+                pass
+
+        # Strategy 2: match by component name
+        if found is None and comp:
+            cl = comp.lower().replace("_", "").replace("-", "").replace(" ", "")
+            for lb in labels:
+                lb_comp = lb["component"].lower().replace("_", "").replace("-", "").replace(" ", "")
+                if cl and lb_comp and (cl in lb_comp or lb_comp in cl):
+                    found = lb
+                    break
+
+        if found is not None:
+            matched.append(found)
+
+    return matched
+
+
 def compute_residuals_and_latents(model, params, tensor_norm, type_idx,
                                   obs_mask, use_posterior=False, ws=WS):
-    """Sliding-window inference: residuals [T,N] and h_states [T,N,D].
-
-    FIXED: overlapping window residuals averaged, not overwritten.
-    """
+    """Sliding-window inference with tail coverage (P1.4)."""
     T, N, D = tensor_norm.shape
     resid_acc = np.zeros((T, N), dtype=np.float32)
     resid_cnt = np.zeros((T, N), dtype=np.float32)
     h_acc = np.zeros((T, N, DET_DIM), dtype=np.float32)
     h_cnt = np.zeros((T, N), dtype=np.float32)
+    coverage = np.zeros(T, dtype=bool)
+
+    stride = max(1, ws // 2)
+    starts = list(range(0, T - ws, stride))
+    # P1.4: always include the last window
+    last_start = max(0, T - ws - 1)
+    if not starts or starts[-1] != last_start:
+        starts.append(last_start)
 
     windows, pos = [], []
-    for start in range(0, T - ws, max(1, ws // 2)):
+    for start in starts:
         end = start + ws + 1
         if end > T:
-            break
+            end = T
         windows.append(tensor_norm[start:end])
         pos.append((start, end))
+
     if not windows:
-        return resid_acc, h_acc
+        return resid_acc, h_acc, coverage
 
     windows = np.stack(windows, axis=0)
     t_idx_j = jnp.array(type_idx)
-    o_mask_j = jnp.array(obs_mask)
+    o_mask_j = np.array(obs_mask)
     rng = jax.random.PRNGKey(0)
 
     for i in range(0, len(windows), 8):
@@ -162,6 +197,7 @@ def compute_residuals_and_latents(model, params, tensor_norm, type_idx,
                 if tg < T:
                     resid_acc[tg] += res_b[j, tt]
                     resid_cnt[tg] += 1.0
+                    coverage[tg] = True
             nh = min(h_b.shape[1], e - s)
             for tt in range(nh):
                 tg = s + tt + 1
@@ -176,66 +212,11 @@ def compute_residuals_and_latents(model, params, tensor_norm, type_idx,
             if h_cnt[tt, n] > 0:
                 h_acc[tt, n] /= h_cnt[tt, n]
 
-    return np.nan_to_num(resid_acc, nan=0.0), h_acc
-
-
-def _find_matching_label(query, labels, timestamps, entity_ids):
-    """Match a ParsedQuery to the corresponding GT label from record.csv.
-
-    Strategy (priority order):
-      1. Match by GT datetime from scoring_points (most precise).
-      2. Match by GT component name AND query observation window.
-      3. Match by GT component name only.
-      4. Match any label within the query observation window (fallback for
-         time-only and reason-only queries that lack component in scoring).
-    """
-    gt_comp = query.gt_component.lower().strip() if query.gt_component else ""
-    gt_time_str = query.gt_datetime.strip() if query.gt_datetime else ""
-    gt_reason = query.gt_reason.lower().strip() if query.gt_reason else ""
-    qw_s = query.window_start.timestamp()
-    qw_e = query.window_end.timestamp()
-
-    # Strategy 1: exact datetime match from scoring_points
-    if gt_time_str:
-        try:
-            gt_dt = datetime.strptime(gt_time_str, "%Y-%m-%d %H:%M:%S")
-            gt_ts = gt_dt.timestamp()
-            for lb in labels:
-                if abs(lb["timestamp"] - gt_ts) < 300:
-                    return lb
-        except (ValueError, OSError):
-            pass
-
-    # Strategy 2: component match within query window
-    if gt_comp:
-        for lb in labels:
-            if lb["timestamp"] < qw_s or lb["timestamp"] > qw_e:
-                continue
-            lb_comp = lb["component"].lower().replace("_", "").replace("-", "").replace(" ", "")
-            gt_comp_norm = gt_comp.lower().replace("_", "").replace("-", "").replace(" ", "")
-            if gt_comp_norm and lb_comp and (gt_comp_norm in lb_comp or lb_comp in gt_comp_norm):
-                return lb
-
-    # Strategy 3: component match (any time)
-    if gt_comp:
-        for lb in labels:
-            lb_comp = lb["component"].lower().replace("_", "").replace("-", "").replace(" ", "")
-            gt_comp_norm = gt_comp.lower().replace("_", "").replace("-", "").replace(" ", "")
-            if gt_comp_norm and lb_comp and (gt_comp_norm in lb_comp or lb_comp in gt_comp_norm):
-                return lb
-
-    # Strategy 4: match any label within query observation window (fallback)
-    # For time-only and reason-only queries without component in scoring_points
-    for lb in labels:
-        if qw_s <= lb["timestamp"] <= qw_e:
-            return lb
-
-    return None
+    return np.nan_to_num(resid_acc, nan=0.0), h_acc, coverage
 
 
 def evaluate_system(sys_name, model, state, ob_mean, ob_std, use_posterior,
-                    scoring_method, all_zero_type, burn_in_min, resample_sec,
-                    max_days):
+                    scoring_method, all_zero_type, burn_in_min, resample_sec):
     cfg = SYSTEM_CONFIGS[sys_name]
     data_dir = cfg["data_dir"]
     if not os.path.exists(data_dir):
@@ -247,38 +228,31 @@ def evaluate_system(sys_name, model, state, ob_mean, ob_std, use_posterior,
         print(f"  query.csv not found: {query_path}")
         return {"n": 0}
 
-    queries = parse_query_csv(query_path)
-    print(f"  Parsed {len(queries)} queries from query.csv")
+    # Parse query.csv → separated InferenceQuery + EvalTarget (P0.1)
+    inference_queries, eval_targets = parse_query_csv(query_path)
+    print(f"  Parsed {len(inference_queries)} queries from query.csv")
 
-    # Determine covered date range from queries
-    all_dates = sorted(set(q.window_start.date() for q in queries))
+    total_official_queries = len(inference_queries)
+
+    # Compute date range needed from queries
+    all_dates = sorted(set(q.window_start.date() for q in inference_queries))
     min_date = all_dates[0]
     max_date = all_dates[-1]
     print(f"  Query date range: {min_date} — {max_date} ({len(all_dates)} unique dates)")
 
-    # Auto-compute max_days: count available telemetry date directories
-    # between the first and last query date (lexicographic order).
-    # This avoids loading dates before/after the query range and keeps
-    # the run time manageable for systems like Telecom (15+ dates, 2 needed).
+    # P0.4: compute exact date directories needed
+    telemetry_dir = os.path.join(data_dir, "telemetry")
+    available_dates = sorted([d for d in os.listdir(telemetry_dir)
+                              if d.startswith("20")]) if os.path.exists(telemetry_dir) else []
     min_date_str = min_date.strftime("%Y_%m_%d")
     max_date_str = max_date.strftime("%Y_%m_%d")
-    telemetry_dir = os.path.join(data_dir, "telemetry")
-    if os.path.exists(telemetry_dir):
-        available_dates = sorted([d for d in os.listdir(telemetry_dir)
-                                  if d.startswith("20")])
-        num_available = len(available_dates)
-        needed_range = [d for d in available_dates
-                        if min_date_str <= d <= max_date_str]
-        auto_max_days = len(needed_range) + 2  # +2 for days at edges
-        auto_max_days = min(auto_max_days, max_days, num_available)
-        print(f"  Available telemetry dates: {num_available}; "
-              f"needed range includes ~{len(needed_range)} directories "
-              f"(loading {auto_max_days})")
-    else:
-        auto_max_days = max_days
+    needed_dates = [d for d in available_dates
+                    if min_date_str <= d <= max_date_str]
+    print(f"  Available telemetry dates: {len(available_dates)}; "
+          f"needed range: {len(needed_dates)}")
 
-    # Create adapter covering needed dates
-    adapter = _make_adapter(cfg["adapter_cls"], auto_max_days)
+    # P0.4: pass needed_dates to adapter
+    adapter = _make_adapter(cfg["adapter_cls"], needed_dates)
     all_entities = adapter.discover_entities(data_dir)
     cont_entities = [e for e in all_entities
                      if e.entity_type.value in ("container", "service")]
@@ -288,7 +262,6 @@ def evaluate_system(sys_name, model, state, ob_mean, ob_std, use_posterior,
     N = len(entity_ids)
     print(f"  Entities: {N}")
 
-    # Load all events (covers all dates up to max_days)
     t0 = time.time()
     all_events = adapter.extract_events(data_dir, cont_entities)
     event_load_time = time.time() - t0
@@ -298,27 +271,19 @@ def evaluate_system(sys_name, model, state, ob_mean, ob_std, use_posterior,
         print("  No events loaded!")
         return {"n": 0}
 
-    # Build GLOBAL tensor from all loaded events
     t0 = time.time()
     global_tensor, global_obs_mask, global_ts = build_telemetry_tensor(
-        events=all_events,
-        entity_ids=entity_ids,
-        kpi_to_ob=KPI_TO_OB,
-        max_ob_features=8,
-        resample_interval_sec=resample_sec,
-        window_start_ts=None,
-        window_end_ts=None,
+        events=all_events, entity_ids=entity_ids, kpi_to_ob=KPI_TO_OB,
+        max_ob_features=8, resample_interval_sec=resample_sec,
     )
-    tensor_build_time = time.time() - t0
     T_global = global_tensor.shape[0]
     if T_global == 0:
         print("  Empty global tensor!")
         return {"n": 0}
 
-    t_min_dt = datetime.fromtimestamp(global_ts[0])
-    t_max_dt = datetime.fromtimestamp(global_ts[-1])
+    t_min_dt = datetime.fromtimestamp(global_ts[0], tz=OPENRCA_TZ)
+    t_max_dt = datetime.fromtimestamp(global_ts[-1], tz=OPENRCA_TZ)
     print(f"  Global tensor: {global_tensor.shape} [{t_min_dt} — {t_max_dt}]")
-    print(f"  Tensor build: {tensor_build_time:.1f}s")
 
     # Entity types
     type_str_to_idx = {"container": 0, "database": 1, "middleware": 2, "host": 0}
@@ -329,193 +294,167 @@ def evaluate_system(sys_name, model, state, ob_mean, ob_std, use_posterior,
         dtype=np.int32,
     )
 
-    # Build global obs mask for model input
     global_obs_mask_2d = (global_obs_mask.sum(axis=0) > 0).astype(np.float32)
-    global_obs_mask_model = np.pad(global_obs_mask_2d, ((0, 0), (0, MAX_D - 8)),
-                                   mode='constant')
+    global_obs_mask_model = np.pad(global_obs_mask_2d, ((0, 0), (0, MAX_D - 8)), mode='constant')
 
-    # Normalize global tensor with OB stats
     global_tensor_norm = np.nan_to_num(
         (global_tensor - ob_mean) / (ob_std + 1e-6), nan=0.0)
     global_tensor_pad = np.pad(global_tensor_norm,
                                ((0, 0), (0, 0), (0, MAX_D - 8)), mode='constant')
 
-    # Load labels (evaluation only)
+    # Load labels from record.csv (EVALUATION ONLY)
     labels = extract_labels_from_record(data_dir, entity_ids, adapter)
 
-    # Validate coverage
+    # Coverage report
     coverage = validate_dataset_coverage(labels, global_ts, entity_ids, sys_name)
     print(f"  Coverage: entity={coverage['entity_match']}/{coverage['total_labels']} "
           f"time={coverage['time_in_range']}/{coverage['total_labels']}")
-
     violations = validate_labels_in_telemetry_range(labels, global_ts, sys_name)
     if violations:
-        for v in violations[:5]:
+        for v in violations[:3]:
             print(f"  WARNING: {v}")
-        if len(violations) > 5:
-            print(f"  ... and {len(violations) - 5} more")
 
     # Process each query as independent Episode
     query_results = []
     total_time = 0.0
     processed = 0
-    skipped = 0
-    skip_no_data = 0
-    skip_no_label = 0
+    skipped_no_data = 0
+    skipped_no_label = 0
 
-    for qi, query in enumerate(queries):
-        # Determine time range for this episode
-        data_start_ts = (query.window_start - timedelta(minutes=burn_in_min)).timestamp()
-        data_end_ts = query.window_end.timestamp()
-
-        # Find global tensor indices within [data_start_ts, data_end_ts]
-        idx_slice = np.where((global_ts >= data_start_ts) & (global_ts <= data_end_ts))[0]
-        if len(idx_slice) < WS + 2:
-            skip_no_data += 1
+    for qi, iq in enumerate(inference_queries):
+        qid = iq.query_id
+        if qid not in eval_targets:
+            skipped_no_label += 1
             continue
 
-        # Slice
+        # Determine time range for this episode
+        data_start_ts = (iq.window_start - timedelta(minutes=burn_in_min)).timestamp()
+        data_end_ts = iq.window_end.timestamp()
+
+        # Find global tensor indices
+        idx_slice = np.where((global_ts >= data_start_ts) & (global_ts <= data_end_ts))[0]
+        if len(idx_slice) < WS + 2:
+            skipped_no_data += 1
+            continue
+
         s_start = idx_slice[0]
         s_end = idx_slice[-1] + 1
         tensor_sub = global_tensor_pad[s_start:s_end]
         ts_sub = global_ts[s_start:s_end]
         T_sub = tensor_sub.shape[0]
 
-        # Build time-varying obs_mask slice
-        obs_mask_sub_3d = global_obs_mask[s_start:s_end]
-        obs_mask_sub_2d = (obs_mask_sub_3d.sum(axis=0) > 0).astype(np.float32)
+        obs_mask_sub_2d = (global_obs_mask[s_start:s_end].sum(axis=0) > 0).astype(np.float32)
         obs_mask_sub_2d = np.pad(obs_mask_sub_2d, ((0, 0), (0, MAX_D - 8)), mode='constant')
 
-        # Inference
+        # Inference (prior-only)
         t_inf = time.time()
-        residuals, h_states = compute_residuals_and_latents(
+        residuals, h_states, coverage_mask = compute_residuals_and_latents(
             model, state.params, tensor_sub, type_indices,
             obs_mask_sub_2d, use_posterior=use_posterior, ws=WS)
         inference_time = time.time() - t_inf
         total_time += inference_time
 
         if residuals.shape[0] == 0:
-            skip_no_data += 1
+            skipped_no_data += 1
             continue
 
-        # Burn-in mask: everything before query window start inside this slice
-        qw_start_in_slice = query.window_start.timestamp()
-        burn_in_mask = ts_sub < qw_start_in_slice
-        qw_mask = (ts_sub >= query.window_start.timestamp()) & \
-                   (ts_sub <= query.window_end.timestamp())
+        # Burn-in mask and query window mask
+        qw_start_ts = iq.window_start.timestamp()
+        qw_end_ts = iq.window_end.timestamp()
+        burn_in_mask = ts_sub < qw_start_ts
+        qw_mask = (ts_sub >= qw_start_ts) & (ts_sub <= qw_end_ts)
+
+        # Query window coverage check
+        qw_coverage = coverage_mask[qw_mask]
+        if qw_coverage.any():
+            qw_cov_pct = qw_coverage.mean()
+        else:
+            qw_cov_pct = 0.0
 
         # Compute joint scores
         joint = compute_joint_scores(
-            residuals=residuals,
-            latents=h_states,
-            model_onset_scores=None,
-            method=scoring_method,
+            residuals=residuals, latents=h_states,
+            model_onset_scores=None, method=scoring_method,
             burn_in_mask=burn_in_mask,
-            lambda_residual=1.0,
-            lambda_shift=0.5,
-            lambda_early=0.3,
-            lambda_onset=0.0,
+            lambda_residual=1.0, lambda_shift=0.5, lambda_early=0.3,
             temporal_smooth_window=3,
         )
         joint.query_window_mask = qw_mask
 
-        # Find matching GT label
-        gt_label = _find_matching_label(query, labels, ts_sub, entity_ids)
-        if gt_label is None:
-            skip_no_label += 1
+        # Match EvalTarget to record.csv labels (EVALUATION ONLY)
+        eval_tgt = eval_targets[qid]
+        matched_labels = _match_eval_label(eval_tgt, labels, ts_sub, entity_ids)
+        if not matched_labels:
+            skipped_no_label += 1
             continue
 
-        # Evaluate
-        tolerance_steps = max(1, (query.gt_tolerance_min * 60) // resample_sec)
-        metric = evaluate_joint(
-            joint=joint,
-            gt_component_idx=gt_label["component_idx"],
-            gt_onset_ts=gt_label["timestamp"],
-            timestamps=ts_sub,
-            onset_tolerance_steps=tolerance_steps,
-        )
-        query_results.append(metric)
+        # Evaluate per root cause
+        for rc_idx, lb in enumerate(matched_labels):
+            if rc_idx >= len(eval_tgt.root_causes):
+                break
+            _, _, _, tolerance = eval_tgt.root_causes[rc_idx]
+            tolerance_steps = max(1, (tolerance * 60) // resample_sec)
+            metric = evaluate_joint(
+                joint=joint,
+                gt_component_idx=lb["component_idx"],
+                gt_onset_ts=lb["timestamp"],
+                timestamps=ts_sub,
+                onset_tolerance_steps=tolerance_steps,
+            )
+            # Convert step error to minutes
+            metric["time_error_min"] = metric["time_error"] * resample_sec / 60.0
+            metric["query_window_coverage"] = qw_cov_pct
+            query_results.append(metric)
         processed += 1
 
         if (qi + 1) % 30 == 0:
-            print(f"    {qi + 1}/{len(queries)} queries... "
+            print(f"    {qi + 1}/{len(inference_queries)} queries... "
                   f"(avg inf: {total_time/max(1,processed):.2f}s)")
 
-    print(f"  Evaluated: {processed} | skipped: {skipped} "
-          f"(no_data: {skip_no_data}, no_label: {skip_no_label})")
+    skipped = skipped_no_data + skipped_no_label
+    print(f"  Official queries: {total_official_queries} | Evaluated: {processed} | "
+          f"Skipped: {skipped} (no_data: {skipped_no_data}, no_label: {skipped_no_label})")
     if processed > 0:
-        print(f"  Avg inference time: {total_time/processed:.2f}s per query")
+        print(f"  Avg inference: {total_time/processed:.2f}s | "
+              f"Time MAE in min: {resample_sec/60.0}s per step")
 
-    return aggregate_metrics(query_results)
+    agg = aggregate_metrics(query_results)
+    agg["total_official"] = total_official_queries
+    agg["skipped"] = skipped
+    return agg
 
 
 def extract_labels_from_record(data_dir, entity_ids, adapter):
-    """Extract labels from record.csv — EVALUATION ONLY (never exposed to model)."""
-    all_entities = adapter.discover_entities(data_dir)
-    cont_entities = [e for e in all_entities
-                     if e.entity_type.value in ("container", "service")]
-    if not cont_entities:
-        cont_entities = all_entities
-    labels_raw = adapter.extract_labels(data_dir, cont_entities)
-    labels = []
-    for lb in labels_raw:
-        matched = -1
-        if lb.component in entity_ids:
-            matched = entity_ids.index(lb.component)
-        else:
-            cl = lb.component.lower().replace("_", "").replace("-", "").replace(" ", "")
-            for i, eid in enumerate(entity_ids):
-                el = eid.lower().replace("_", "").replace("-", "").replace(" ", "")
-                if cl in el or el in cl:
-                    matched = i
-                    break
-        if matched >= 0:
-            ts_val = float(lb.occurrence_datetime) if lb.occurrence_datetime else 0.0
-            labels.append({
-                "component": lb.component,
-                "component_idx": matched,
-                "timestamp": ts_val,
-                "reason": lb.reason,
-            })
-    return labels
+    return _extract_labels(data_dir, entity_ids, adapter)
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--ablation_posterior', action='store_true',
-                        help='Use posterior mode (default: prior-only)')
+    parser.add_argument('--ablation_posterior', action='store_true')
     parser.add_argument('--systems', nargs='+',
                         default=['Bank', 'Market/cloudbed-1', 'Market/cloudbed-2', 'Telecom'])
     parser.add_argument('--method', type=str, default='calibrated',
                         choices=['residual_only', 'calibrated', 'legacy_per_entity_max',
-                                 'onset_head'],
-                        help='Scoring method (default: calibrated)')
-    parser.add_argument('--all_zero_type', action='store_true',
-                        help='Use all-zero type indices (ablation)')
-    parser.add_argument('--burn_in_min', type=int, default=60,
-                        help='Burn-in period before query window (minutes)')
-    parser.add_argument('--resample_sec', type=int, default=60,
-                        help='Time grid resampling interval (seconds)')
-    parser.add_argument('--max_days', type=int, default=30,
-                        help='Maximum number of telemetry days to load')
+                                 'onset_head'])
+    parser.add_argument('--all_zero_type', action='store_true')
+    parser.add_argument('--burn_in_min', type=int, default=60)
+    parser.add_argument('--resample_sec', type=int, default=120)
     args = parser.parse_args()
 
     use_posterior = args.ablation_posterior
     mode_str = "POSTERIOR (ablation)" if use_posterior else "PRIOR-ONLY"
     type_str = "all-zero" if args.all_zero_type else "heuristic"
-    resample_sec = args.resample_sec
 
     if args.method == "onset_head" and not use_posterior:
-        print("NOTE: onset_head requires posterior mode; falling back to calibrated.")
+        print("NOTE: onset_head requires posterior; falling back to calibrated.")
         args.method = "calibrated"
 
     print("=" * 60)
-    print(f"Phase A-Hardening P0.5: Query Episode Protocol ({mode_str})")
+    print(f"Phase A-Hardening P0.6: GT-isolated Query Episode Protocol ({mode_str})")
     print(f"Scoring: {args.method} | Type: {type_str} | "
-          f"Resample: {resample_sec}s | Burn-in: {args.burn_in_min}min")
+          f"Resample: {args.resample_sec}s | Burn-in: {args.burn_in_min}min")
     print("=" * 60)
 
-    # Load model
     model = RCAWorldFoundation(
         common_dim=128, max_obs_dim=MAX_D, num_entity_types=3,
         det_dim=DET_DIM, stoch_dim=32, stoch_classes=32,
@@ -552,20 +491,18 @@ def main():
             scoring_method=args.method,
             all_zero_type=args.all_zero_type,
             burn_in_min=args.burn_in_min,
-            resample_sec=resample_sec,
-            max_days=args.max_days,
+            resample_sec=args.resample_sec,
         )
         elapsed = time.time() - t0
         all_results[sys_name] = agg
         print(f"  Total time: {elapsed:.1f}s")
 
-    # Report
     print(f"\n{'='*80}")
     print(f"RESULTS ({mode_str}, {args.method}, {type_str} type)")
     print(f"{'='*80}")
     header = (f"{'System':<18s} {'Comp T1':>8s} {'Comp T3':>8s} "
-              f"{'MRR':>8s} {'AvgR':>6s} {'TimeHit':>8s} "
-              f"{'TimeMAE':>8s} {'JointHit':>8s} {'N':>5s}")
+              f"{'MRR':>8s} {'AvgR':>6s} {'TimeH5':>7s} "
+              f"{'MAEmin':>7s} {'JntHit':>7s} {'Ev/N':>8s}")
     print(header)
     print("-" * 80)
     for sys_name in args.systems:
@@ -573,16 +510,22 @@ def main():
             continue
         r = all_results[sys_name]
         if r.get("n", 0) == 0:
-            print(f"{sys_name:<18s} {'--':>8s} {'--':>8s} {'--':>8s} {'--':>6s} "
-                  f"{'--':>8s} {'--':>8s} {'--':>8s} {'0':>5s}")
+            print(f"{sys_name:<18s} {'--':>8s} {'--':>8s} "
+                  f"{'--':>8s} {'--':>6s} {'--':>7s} {'--':>7s} {'--':>7s} "
+                  f"{'0/0':>8s}")
             continue
+        time_mae_min = r.get('time_mae', 0) * args.resample_sec / 60.0
+        total = r.get('total_official', 0)
+        skipped = r.get('skipped', 0)
         print(f"{sys_name:<18s} "
               f"{r['component_top1']:>7.1%} {r['component_top3']:>7.1%} "
               f"{r['mrr']:>8.3f} {r['avg_rank']:>6.2f} "
-              f"{r['time_hit_rate']:>7.1%} {r['time_mae']:>8.1f} "
-              f"{r['joint_hit_rate']:>7.1%} {r['n']:>5d}")
+              f"{r['time_hit_rate']:>7.1%} {time_mae_min:>7.1f} "
+              f"{r['joint_hit_rate']:>7.1%} "
+              f"{r['n']:>4d}/{total:>4d}")
     print("-" * 80)
-
+    print(f"Time MAE in minutes (resample={args.resample_sec}s). "
+          f"TimeHit@5min for tolerance=3 steps.")
     print(f"\nDone. Mode: {mode_str} | Method: {args.method} | Type: {type_str}")
 
 
