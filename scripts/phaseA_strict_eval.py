@@ -1,4 +1,7 @@
-"""Phase A-Hardening P0.6: GT-isolated Query Episode Protocol evaluation.
+"""[DEPRECATED] Phase A-Hardening P0.6: GT-isolated Query Episode Protocol evaluation.
+
+DEPRECATED since Phase 0.8. Use phaseA_run_inference.py + phaseA_evaluate_predictions.py instead.
+This file is kept for backward compatibility only.
 
 GT isolation (P0.1):
   - InferenceQuery: observation metadata ONLY. NEVER contains GT.

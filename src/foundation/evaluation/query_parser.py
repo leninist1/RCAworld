@@ -221,93 +221,148 @@ def _parse_fault_count_from_text(instruction: str) -> int:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# Main parse: returns separated InferenceQuery + EvalTarget
+# Phase 0.8: split inference vs evaluation paths
 # ═══════════════════════════════════════════════════════════════════════
 
-def parse_query_csv(query_csv_path: str) -> Tuple[
-        List[InferenceQuery], Dict[int, EvalTarget]]:
-    """Parse OpenRCA query.csv into GT-isolated InferenceQuery and EvalTarget.
+def _parse_query_row_to_inference(task: str, instruction: str, idx: int) -> Optional[InferenceQuery]:
+    """Parse a single query.csv row into an InferenceQuery (NO GT).
 
-    InferenceQuery objects contain ONLY observation metadata:
-      - query_id, instruction, window_start, window_end
-      - need_time / need_component / need_reason (from task_index)
-      - expected_fault_count
+    This function reads ONLY task_index and instruction columns.
+    It NEVER reads scoring_points.
+    """
+    date = parse_date_from_text(instruction)
+    time_range = parse_time_range_from_text(instruction)
+    if date is None or time_range is None:
+        return None
 
-    EvalTarget objects contain ONLY ground truth (for evaluation):
-      - List of (component, datetime, reason, tolerance_min) tuples
+    sh, sm, eh, em = time_range
+    window_start = _make_utc8_dt(date.year, date.month, date.day, sh, sm)
+    window_end = _make_utc8_dt(date.year, date.month, date.day, eh, em)
 
-    These two types must NEVER be passed to the same function.
-    Inference code imports InferenceQuery ONLY.
-    Evaluation code imports EvalTarget + reads record.csv.
+    # Handle cross-midnight: if window_end <= window_start, it wraps to next day
+    if window_end <= window_start:
+        window_end += timedelta(days=1)
+
+    fields = TASK_FIELD_MAP.get(task, {})
+    need_time = fields.get("need_time", True)
+    need_component = fields.get("need_component", True)
+    need_reason = fields.get("need_reason", True)
+
+    text_fault_count = _parse_fault_count_from_text(instruction)
+
+    return InferenceQuery(
+        query_id=idx,
+        instruction=instruction,
+        window_start=window_start,
+        window_end=window_end,
+        need_time=need_time,
+        need_component=need_component,
+        need_reason=need_reason,
+        expected_fault_count=text_fault_count,
+    )
+
+
+def _parse_scoring_to_eval_target(task: str, scoring: str, idx: int) -> EvalTarget:
+    """Parse scoring_points into an EvalTarget (GT ONLY).
+
+    This function reads ONLY scoring_points. It NEVER reads instruction.
+    """
+    fields = TASK_FIELD_MAP.get(task, {})
+    need_time = fields.get("need_time", True)
+    need_component = fields.get("need_component", True)
+    need_reason = fields.get("need_reason", True)
+
+    gt_datetime, gt_tolerance = _parse_gt_time(scoring)
+    gt_components = _parse_gt_components(scoring)
+    gt_reasons = _parse_gt_reasons(scoring)
+    gt_fault_count = max(len(gt_components), len(gt_reasons), 1)
+
+    root_causes = []
+    for fi in range(gt_fault_count):
+        comp = gt_components[fi] if fi < len(gt_components) else ""
+        dt_str = gt_datetime if fi == 0 else ""
+        reason = gt_reasons[fi] if fi < len(gt_reasons) else ""
+        root_causes.append((comp, dt_str, reason, gt_tolerance))
+
+    return EvalTarget(
+        query_id=idx,
+        root_causes=root_causes,
+        need_time=need_time,
+        need_component=need_component,
+        need_reason=need_reason,
+    )
+
+
+def parse_inference_queries(query_csv_path: str) -> List[InferenceQuery]:
+    """Parse query.csv into InferenceQuery list — ZERO GT access.
+
+    This function reads ONLY the task_index and instruction columns from
+    query.csv. It NEVER reads the scoring_points column. It also never
+    reads record.csv.
+
+    Safe for use in inference-only scripts that should not access ground
+    truth.
+
+    Args:
+        query_csv_path: Path to the query.csv file.
 
     Returns:
-        (inference_queries, eval_targets_by_id)
-          inference_queries: one per query row (not per fault).
-          eval_targets_by_id: dict keyed by query_id.
+        List of InferenceQuery objects (one per row).
     """
     df = pd.read_csv(query_csv_path)
     inference_queries: List[InferenceQuery] = []
-    eval_targets: Dict[int, EvalTarget] = {}
 
     for idx, row in df.iterrows():
         task = str(row.get("task_index", ""))
         instruction = str(row.get("instruction", ""))
+        iq = _parse_query_row_to_inference(task, instruction, idx)
+        if iq is not None:
+            inference_queries.append(iq)
+
+    return inference_queries
+
+
+def load_eval_targets(query_csv_path: str) -> Dict[int, EvalTarget]:
+    """Load EvalTarget from query.csv scoring_points — evaluation only.
+
+    This function reads the scoring_points column from query.csv. It
+    should ONLY be used in evaluation scripts, AFTER inference is done.
+
+    Args:
+        query_csv_path: Path to the query.csv file.
+
+    Returns:
+        Dict mapping query_id -> EvalTarget.
+    """
+    df = pd.read_csv(query_csv_path)
+    eval_targets: Dict[int, EvalTarget] = {}
+
+    for idx, row in df.iterrows():
+        task = str(row.get("task_index", ""))
         scoring = str(row.get("scoring_points", ""))
-
-        date = parse_date_from_text(instruction)
-        time_range = parse_time_range_from_text(instruction)
-        if date is None or time_range is None:
+        if not scoring or scoring == "nan":
             continue
+        eval_targets[idx] = _parse_scoring_to_eval_target(task, scoring, idx)
 
-        sh, sm, eh, em = time_range
-        window_start = _make_utc8_dt(date.year, date.month, date.day, sh, sm)
-        window_end = _make_utc8_dt(date.year, date.month, date.day, eh, em)
+    return eval_targets
 
-        # Handle cross-midnight: if window_end <= window_start, it wraps to next day
-        if window_end <= window_start:
-            window_end += timedelta(days=1)
 
-        fields = TASK_FIELD_MAP.get(task, {})
-        need_time = fields.get("need_time", True)
-        need_component = fields.get("need_component", True)
-        need_reason = fields.get("need_reason", True)
+# ═══════════════════════════════════════════════════════════════════════
+# Deprecated: combined parse (kept for backward compatibility)
+# ═══════════════════════════════════════════════════════════════════════
 
-        # Parse GT from scoring_points (hidden, for EvalTarget only)
-        gt_datetime, gt_tolerance = _parse_gt_time(scoring)
-        gt_components = _parse_gt_components(scoring)
-        gt_reasons = _parse_gt_reasons(scoring)
-        gt_fault_count = max(len(gt_components), len(gt_reasons), 1)
+def parse_query_csv(query_csv_path: str) -> Tuple[
+        List[InferenceQuery], Dict[int, EvalTarget]]:
+    """[DEPRECATED] Parse OpenRCA query.csv into GT-isolated InferenceQuery and EvalTarget.
 
-        # InferenceQuery: fault count from QUERY TEXT only (NOT from GT)
-        text_fault_count = _parse_fault_count_from_text(instruction)
+    DEPRECATED since Phase 0.8. Use parse_inference_queries() and
+    load_eval_targets() separately instead.
 
-        # InferenceQuery: zero GT
-        inference_queries.append(InferenceQuery(
-            query_id=idx,
-            instruction=instruction,
-            window_start=window_start,
-            window_end=window_end,
-            need_time=need_time,
-            need_component=need_component,
-            need_reason=need_reason,
-            expected_fault_count=text_fault_count,
-        ))
-
-        # EvalTarget: only GT (uses GT-derived count for matching)
-        root_causes = []
-        for fi in range(gt_fault_count):
-            comp = gt_components[fi] if fi < len(gt_components) else ""
-            dt_str = gt_datetime if fi == 0 else ""
-            reason = gt_reasons[fi] if fi < len(gt_reasons) else ""
-            root_causes.append((comp, dt_str, reason, gt_tolerance))
-        eval_targets[idx] = EvalTarget(
-            query_id=idx,
-            root_causes=root_causes,
-            need_time=need_time,
-            need_component=need_component,
-            need_reason=need_reason,
-        )
-
+    This function is kept for backward compatibility with existing scripts
+    (phaseA_strict_eval.py) which have not yet been migrated.
+    """
+    inference_queries = parse_inference_queries(query_csv_path)
+    eval_targets = load_eval_targets(query_csv_path)
     return inference_queries, eval_targets
 
 

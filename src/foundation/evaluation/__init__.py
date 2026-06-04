@@ -21,6 +21,8 @@ from .query_parser import (
     InferenceQuery,
     EvalTarget,
     parse_query_csv,
+    parse_inference_queries,
+    load_eval_targets,
     format_episode_window,
     TASK_FIELD_MAP,
     OPENRCA_TZ,
