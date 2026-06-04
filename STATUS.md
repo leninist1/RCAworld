@@ -206,36 +206,38 @@
 > 此前报告 24.3% Top-1 含 GT-component 泄露（先读 rc 再选 window 峰值）
 > 当前 0.7% 是可信的无泄露严格零样本基线
 
-### Phase A-Hardening P0.6: GT Isolation + Time Hit Fix 🟩
+### Phase A-Hardening P0.7: Protocol Closure 🟩
 
-**核心修复** (commit `b2b566c`, 2026-06-04):
+**P0.1 — expected_fault_count 来自查询文本，而非 scoring_points**:
+- `_parse_fault_count_from_text()` 从 instruction 文本提取故障数量（"a single failure"→1, "two failures"→2）
+- `InferenceQuery.expected_fault_count` 不再接触 GT
+- GT 故障数量保留在 `EvalTarget.root_causes` 列表中
 
-| # | 问题 | 修复 |
-|---|------|------|
-| P0.1 | InferenceQuery 与 GT 在同一数据结构中 | `InferenceQuery` (无GT) 与 `EvalTarget` (仅GT) 完全隔离 |
-| P0.2 | Time Hit 可能在 burn-in 区间取峰值 | `onset_score` 使用 query_window_mask 约束在查询窗口内 |
-| P0.3 | 多故障 Query 被错误拆分为多个独立 Episode | 单窗口一次 Episode + NMS 解码多峰 |
-| P0.4 | Adapter 加载"前N天"而非查询需要的日期 | 从 query 日期范围自动计算 needed_dates |
-| P1.1 | naive datetime 无时区 | 全局 UTC+8 (Asia/Shanghai)，跨午夜处理 |
-| P1.4 | 滑动窗口尾部可能未覆盖 | 始终补上最后一个窗口 + 返回 coverage_mask |
+**P0.2 — NMS 多故障解码接入正式评估循环**:
+- `JointScores.decode_multiple_faults()` 通过 NMS 解码多个峰值
+- 评估循环使用贪心一对一匹配：预测 → GT
+- 对超过预测数量的 GT，回退到 single-best
 
-**关键代码变更**:
-| 文件 | 变更 |
-|------|------|
-| `query_parser.py` | 拆分为 `InferenceQuery`（零GT）+ `EvalTarget`（仅GT）；返回 `(List[InferenceQuery], Dict[int, EvalTarget])` |
-| `strict_eval.py` | `onset_score` 属性加入 query_window_mask；新增 `decode_multiple_faults()` NMS 函数 |
-| `episode_builder.py` | `build_episode()` 只接受 `InferenceQuery`（移除所有 GT 字段引用） |
-| `phaseA_strict_eval.py` | 推理路径只接触 InferenceQuery；评估路径只读取 EvalTarget + record.csv |
+**P0.3 — Adapter 接受 `include_dates: Set[str]`**:
+- 三个 Adapter 均支持 `include_dates` 参数
+- `_get_days()` 过滤到仅包含指定日期目录
+- 验证：加载单日将事件数从 3.2M 降至 76K
 
-**P0.6 实验结果** (Bank, prior-only, calibrated, 30min burn-in, 120s resample):
+**P0.4 — 指标报告分离查询级别和根因级别计数**:
+- 输出：official queries、evaluated queries、total root-causes
+- `aggregate_metrics` 同时追踪 n（根因实例）和 n_queries_evaluated
 
-| 方法 | Comp T1 | Comp T3 | MRR | TimeH5 | MAE(min) | JntHit | Ev/Official |
-|------|---------|---------|-----|--------|----------|--------|-------------|
-| calibrated (all-zero) | 6.6% | 24.8% | 0.232 | 9.9% | 20.3 | 0.0% | 121/131 |
+**P0.6 — Burn-in 日期覆盖扩展到查询窗口开始前的日期**:
+- `min_data_date` 从最早 `window_start - burn_in_min` 计算
+- `needed_dates_set` 覆盖完整 `[min_data_date, max_data_date]` 范围
 
-> **注**: Time Hit 从 P0.5 的 13.2% 降到 9.9%，原因是现在 onset_score 被正确约束在查询窗口内（而非全时间轴）。Time MAE = 20.3分钟。22 条 query 因未匹配到 record.csv label 被跳过。
+**P1.1 — TimeHit 报告 Hit@5min、Hit@10min、Hit@15min**:
+- 新增字段：`time_hit_5min`、`time_hit_10min`、`time_hit_15min`
+- `time_mae_min` 以实际分钟数计算
 
-### 下一优先级: Learned Onset Head 参与 strict eval 🟦
+**审计结果**: 5/5 P0 项全部修复，2/2 P1 项全部修复。
+
+### 下一优先级: Learned Onset Head 参与 strict eval → Synthetic Perturbation 🟦
 
 ---
 
