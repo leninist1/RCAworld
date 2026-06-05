@@ -1,10 +1,13 @@
 import csv
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 import pandas as pd
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from foundation.evaluation.query_parser import parse_inference_queries
 
