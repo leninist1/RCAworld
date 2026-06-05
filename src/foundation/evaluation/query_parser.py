@@ -110,23 +110,15 @@ _TIME_RANGE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _GT_TIME_PATTERN = re.compile(
-    r'(?:The\s+(?:(\d+)-th\s+)?predicted\s+)?root cause occurrence time is within\s+(\d+)\s+minutes?.*?of\s+(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})',
+    r'(?:The\s+(?:(\d+)-th|only)\s+)?(?:predicted\s+)?root cause occurrence time is within\s+(\d+)\s+minutes?.*?of\s+(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})',
     re.IGNORECASE,
 )
 _GT_COMPONENT_PATTERN = re.compile(
-    r'(?:The\s+[\d]+-th\s+)?predicted root cause component is\s+([^\n\r]+)',
+    r'(?:The\s+(?:(\d+)-th|only)\s+)?predicted root cause component is\s+([^\n\r]+)',
     re.IGNORECASE,
 )
 _GT_REASON_PATTERN = re.compile(
-    r'(?:The\s+[\d]+-th\s+)?predicted root cause reason is\s+([^\n\r]+)',
-    re.IGNORECASE,
-)
-_MULTI_COMPONENT_PATTERN = re.compile(
-    r'The\s+(\d+)-th\s+predicted root cause component is\s+([^\n\r]+)',
-    re.IGNORECASE,
-)
-_MULTI_REASON_PATTERN = re.compile(
-    r'The\s+(\d+)-th\s+predicted root cause reason is\s+([^\n\r]+)',
+    r'(?:The\s+(?:(\d+)-th|only)\s+)?predicted root cause reason is\s+([^\n\r]+)',
     re.IGNORECASE,
 )
 # Parse fault count from instruction text ONLY (never from scoring_points)
@@ -193,23 +185,17 @@ def _parse_gt_times(scoring_points: str) -> Dict[int, Tuple[str, int]]:
 
 def _parse_gt_components(scoring_points: str) -> Dict[int, str]:
     components: Dict[int, str] = {}
-    for m in _MULTI_COMPONENT_PATTERN.finditer(scoring_points):
-        components[int(m.group(1))] = m.group(2).strip()
-    if not components:
-        m = _GT_COMPONENT_PATTERN.search(scoring_points)
-        if m:
-            components[1] = m.group(1).strip()
+    for m in _GT_COMPONENT_PATTERN.finditer(scoring_points):
+        idx = int(m.group(1)) if m.group(1) else len(components) + 1
+        components[idx] = m.group(2).strip()
     return components
 
 
 def _parse_gt_reasons(scoring_points: str) -> Dict[int, str]:
     reasons: Dict[int, str] = {}
-    for m in _MULTI_REASON_PATTERN.finditer(scoring_points):
-        reasons[int(m.group(1))] = m.group(2).strip()
-    if not reasons:
-        m = _GT_REASON_PATTERN.search(scoring_points)
-        if m:
-            reasons[1] = m.group(1).strip()
+    for m in _GT_REASON_PATTERN.finditer(scoring_points):
+        idx = int(m.group(1)) if m.group(1) else len(reasons) + 1
+        reasons[idx] = m.group(2).strip()
     return reasons
 
 

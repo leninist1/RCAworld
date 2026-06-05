@@ -94,13 +94,13 @@ class ParseInferenceQueriesGtIsolationTest(unittest.TestCase):
 
     def test_load_eval_targets_parses_each_root_cause_time(self):
         scoring_points = "\n".join([
-            "The 1-th predicted root cause occurrence time is within 1 minutes of 2024-01-01 01:10:00",
+            "The 1-th root cause occurrence time is within 1 minutes (i.e., <=1min) of 2024-01-01 01:10:00",
             "The 1-th predicted root cause component is service_a",
             "The 1-th predicted root cause reason is cpu saturation",
-            "The 2-th predicted root cause occurrence time is within 2 minutes of 2024-01-01 01:20:00",
+            "The 2-th root cause occurrence time is within 2 minutes (i.e., <=2min) of 2024-01-01 01:20:00",
             "The 2-th predicted root cause component is service_b",
             "The 2-th predicted root cause reason is disk latency",
-            "The 3-th predicted root cause occurrence time is within 3 minutes of 2024-01-01 01:30:00",
+            "The 3-th root cause occurrence time is within 3 minutes (i.e., <=3min) of 2024-01-01 01:30:00",
             "The 3-th predicted root cause component is service_c",
             "The 3-th predicted root cause reason is network loss",
         ])
@@ -137,6 +137,32 @@ class ParseInferenceQueriesGtIsolationTest(unittest.TestCase):
                     ("service_b", "2024-01-01 01:20:00", "disk latency", 2),
                     ("service_c", "2024-01-01 01:30:00", "network loss", 3),
                 ],
+            )
+
+    def test_load_eval_targets_parses_official_only_root_cause(self):
+        scoring_points = "\n".join([
+            "The only root cause occurrence time is within 1 minutes (i.e., <=1min) of 2024-01-01 01:10:00",
+            "The only predicted root cause component is service_a",
+            "The only predicted root cause reason is cpu saturation",
+        ])
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            query_csv = Path(tmpdir) / "query.csv"
+            write_query_csv(
+                query_csv,
+                ["task_index", "instruction", "scoring_points"],
+                {
+                    "task_index": "task_7",
+                    "instruction": INSTRUCTION,
+                    "scoring_points": scoring_points,
+                },
+            )
+
+            eval_targets = load_eval_targets(str(query_csv))
+
+            self.assertEqual(
+                eval_targets[0].root_causes,
+                [("service_a", "2024-01-01 01:10:00", "cpu saturation", 1)],
             )
 
 
