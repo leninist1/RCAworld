@@ -309,7 +309,13 @@ def parse_inference_queries(query_csv_path: str) -> List[InferenceQuery]:
     Returns:
         List of InferenceQuery objects (one per row).
     """
-    df = pd.read_csv(query_csv_path)
+    df = pd.read_csv(
+        query_csv_path,
+        usecols=[
+            "task_index",
+            "instruction",
+        ],
+    )
     inference_queries: List[InferenceQuery] = []
 
     for idx, row in df.iterrows():
