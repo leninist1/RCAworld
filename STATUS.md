@@ -237,7 +237,37 @@
 
 **审计结果**: 5/5 P0 项全部修复，2/2 P1 项全部修复。
 
-### 下一优先级: Learned Onset Head 参与 strict eval → Synthetic Perturbation 🟦
+### Phase 0.8 R1: 推理/评估路径分离 🟩 (commit `31338d7`)
+
+**目标**: 确保推理脚本在文件级别无法访问 GT。推理与评估完全解耦为两个独立脚本。
+
+| # | 任务 | 状态 |
+|---|------|------|
+| 0.8.1 | `parse_inference_queries()` — 仅读取 task_index + instruction，零 GT 访问 | 🟩 |
+| 0.8.2 | `load_eval_targets()` — 读取 scoring_points，仅用于评估 | 🟩 |
+| 0.8.3 | `scripts/phaseA_run_inference.py` — 推理脚本，禁止 import EvalTarget | 🟩 |
+| 0.8.4 | `scripts/phaseA_evaluate_predictions.py` — 评估脚本，读取 predictions.json + scoring_points + record.csv | 🟩 |
+| 0.8.5 | `predictions.json` 输出: query_id + predictions[datetime, component, score] | 🟩 |
+| 0.8.6 | 验收: 删除 record.csv 后推理仍可运行 | 🟩 |
+| 0.8.7 | 验收: 删除 scoring_points 列后推理仍可运行 | 🟩 |
+
+**文件变更**:
+- 新增: `scripts/phaseA_run_inference.py` (372 行)
+- 新增: `scripts/phaseA_evaluate_predictions.py` (263 行)
+- 修改: `src/foundation/evaluation/query_parser.py` — 拆分 parse_query_csv → parse_inference_queries + load_eval_targets
+- 修改: `scripts/phaseA_strict_eval.py` — 标记 [DEPRECATED]
+- 修改: `src/foundation/evaluation/__init__.py` — 导出新函数
+
+**使用方式**:
+```bash
+# Step 1: 推理 (无 GT)
+python scripts/phaseA_run_inference.py --systems Bank --output predictions.json
+
+# Step 2: 评估 (使用 GT)
+python scripts/phaseA_evaluate_predictions.py --predictions predictions.json --systems Bank
+```
+
+### 下一优先级: Phase 0.8 R2 — 多故障 + 参数调优 🟦
 
 ---
 

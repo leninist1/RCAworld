@@ -106,6 +106,7 @@ Telemetry Events (metrics / logs / traces / alerts)
 |------|------|------|
 | 通用 Entity/Relation/Event Schema | Bank 容器、Market 服务、Telecom 混合实体无损表示 | 🟩 |
 | OpenRCA 三系统 Adapter | 正常时段数据可训练，故障时段数据可评估 | 🟩 |
+| Phase 0.8: 推理/评估路径分离 | inference 无法访问 GT；predictions.json 独立输出 | 🟩 |
 | Onset Head 替换窗口选择 | Bank clean eval Top-1 >= 45%（当前38%） | ⬜ 待实验 |
 | time-component 联合准确率 | 不低于当前 clean eval | ⬜ 待实验 |
 | strict zero-shot (OB→OpenRCA) | 报告 baseline 供 Phase B 对比 | ⬜ 待实验 |
@@ -151,9 +152,13 @@ RCAWorld/
 │       │   └── pretrain.py            # Pretrain + finetune 管线
 │       │
 │       └── evaluation/
-│           └── openrca_metrics.py     # Top-K, MRR, onset accuracy, exact match
+│           ├── query_parser.py        # Phase 0.8: parse_inference_queries() / load_eval_targets() 分离
+│           ├── strict_eval.py         # JointScores, calibrated scoring, NMS 多故障解码
+│           ├── episode_builder.py     # build_telemetry_tensor, build_episode
+│           ├── openrca_metrics.py     # Top-K, MRR, onset accuracy, exact match
+│           └── leakage_checks.py      # GT 泄露审计
 │
-├── scripts/                           # master 分支 — 各 Phase 评估脚本
+├── scripts/                           # 各 Phase 脚本 (master + foundation)
 ├── checkpoints/                       # 训练好的模型
 ├── data/processed/                    # 预处理 HDF5 数据
 ├── README.md                          # 本文档
