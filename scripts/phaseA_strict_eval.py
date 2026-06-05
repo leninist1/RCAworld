@@ -397,12 +397,12 @@ def evaluate_system(sys_name, model, state, ob_mean, ob_std, use_posterior,
 
         # P0.7: use NMS to decode multiple fault predictions from single S[t,c]
         requested_faults = iq.expected_fault_count
-        gt_fault_count = len(eval_tgt.root_causes)
         min_time_dist = max(3, (5 * 60) // resample_sec)  # min 5min between faults
         predictions = joint.decode_multiple_faults(
-            max_faults=max(requested_faults, gt_fault_count),
+            max_faults=requested_faults,
             min_time_distance=min_time_dist,
         )
+        gt_fault_count = len(eval_tgt.root_causes)
 
         # Greedy one-to-one matching: predictions to GT labels
         for rc_idx, lb in enumerate(matched_labels):

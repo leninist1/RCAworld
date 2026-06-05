@@ -130,8 +130,20 @@ _MULTI_REASON_PATTERN = re.compile(
     re.IGNORECASE,
 )
 # Parse fault count from instruction text ONLY (never from scoring_points)
-_FAULT_COUNT_PATTERN = re.compile(
-    r'(?:a single|one)\s+failure|(\d+)\s+failures|(two|three|four|five)\s+failures',
+_OFFICIAL_FAULT_COUNT_PATTERN = re.compile(
+    r'number\s+of\s+failures\s*:\s*(\d+)',
+    re.IGNORECASE,
+)
+_NUMERIC_FAULT_COUNT_PATTERN = re.compile(
+    r'\b(\d+)\s+failures?\b',
+    re.IGNORECASE,
+)
+_SINGLE_FAULT_PATTERN = re.compile(
+    r'\b(?:a\s+single|one)\s+failure\b',
+    re.IGNORECASE,
+)
+_WORD_FAULT_COUNT_PATTERN = re.compile(
+    r'\b(two|three|four|five)\s+failures\b',
     re.IGNORECASE,
 )
 _FAULT_COUNT_WORDS = {"two": 2, "three": 3, "four": 4, "five": 5}
@@ -200,24 +212,34 @@ def _parse_gt_reasons(scoring_points: str) -> List[str]:
     return reasons
 
 
-def _parse_fault_count_from_text(instruction: str) -> int:
+def parse_fault_count(instruction: str) -> int:
     """Parse fault count from instruction TEXT only (NEVER from GT/scoring_points).
 
     Examples:
+      "number of failures: 3" -> 3
+      "1 failure" -> 1
       "a single failure was detected" -> 1
       "one failure" -> 1
       "two failures" -> 2
       "three failures" -> 3
       No mention -> 1 (default, safe for single-fault queries)
     """
-    m = _FAULT_COUNT_PATTERN.search(instruction)
-    if not m:
-        return 1  # default: assume single fault
-    if m.group(1):
+    m = _OFFICIAL_FAULT_COUNT_PATTERN.search(instruction)
+    if m:
         return int(m.group(1))
-    if m.group(2):
-        return _FAULT_COUNT_WORDS.get(m.group(2).lower(), 1)
-    return 1  # "a single" or "one" matched with no numeric capture
+
+    m = _NUMERIC_FAULT_COUNT_PATTERN.search(instruction)
+    if m:
+        return int(m.group(1))
+
+    if _SINGLE_FAULT_PATTERN.search(instruction):
+        return 1
+
+    m = _WORD_FAULT_COUNT_PATTERN.search(instruction)
+    if m:
+        return _FAULT_COUNT_WORDS.get(m.group(1).lower(), 1)
+
+    return 1  # default: assume single fault
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -248,7 +270,7 @@ def _parse_query_row_to_inference(task: str, instruction: str, idx: int) -> Opti
     need_component = fields.get("need_component", True)
     need_reason = fields.get("need_reason", True)
 
-    text_fault_count = _parse_fault_count_from_text(instruction)
+    text_fault_count = parse_fault_count(instruction)
 
     return InferenceQuery(
         query_id=idx,

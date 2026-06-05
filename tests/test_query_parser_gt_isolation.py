@@ -9,7 +9,7 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from foundation.evaluation.query_parser import parse_inference_queries
+from foundation.evaluation.query_parser import parse_fault_count, parse_inference_queries
 
 
 INSTRUCTION = (
@@ -35,7 +35,11 @@ class ParseInferenceQueriesGtIsolationTest(unittest.TestCase):
                 {
                     "task_index": "task_7",
                     "instruction": INSTRUCTION,
-                    "scoring_points": "The predicted root cause component is secret_gt",
+                    "scoring_points": (
+                        "The 1-th predicted root cause component is secret_gt_1\n"
+                        "The 2-th predicted root cause component is secret_gt_2\n"
+                        "The 3-th predicted root cause component is secret_gt_3"
+                    ),
                 },
             )
 
@@ -59,6 +63,7 @@ class ParseInferenceQueriesGtIsolationTest(unittest.TestCase):
             self.assertEqual(loaded_columns, [["task_index", "instruction"]])
             self.assertEqual(len(queries), 1)
             self.assertEqual(queries[0].instruction, INSTRUCTION)
+            self.assertEqual(queries[0].expected_fault_count, 1)
 
     def test_runs_when_scoring_points_column_is_absent(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -77,6 +82,11 @@ class ParseInferenceQueriesGtIsolationTest(unittest.TestCase):
             self.assertEqual(len(queries), 1)
             self.assertEqual(queries[0].query_id, 0)
             self.assertEqual(queries[0].expected_fault_count, 1)
+
+    def test_parse_fault_count_from_instruction_text(self):
+        self.assertEqual(parse_fault_count("number of failures: 3"), 3)
+        self.assertEqual(parse_fault_count("a single failure"), 1)
+        self.assertEqual(parse_fault_count("unknown text"), 1)
 
 
 if __name__ == "__main__":

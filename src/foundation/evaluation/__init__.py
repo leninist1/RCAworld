@@ -22,6 +22,7 @@ from .query_parser import (
     EvalTarget,
     parse_query_csv,
     parse_inference_queries,
+    parse_fault_count,
     load_eval_targets,
     format_episode_window,
     TASK_FIELD_MAP,
