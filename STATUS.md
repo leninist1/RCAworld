@@ -267,7 +267,25 @@ python scripts/phaseA_run_inference.py --systems Bank --output predictions.json
 python scripts/phaseA_evaluate_predictions.py --predictions predictions.json --systems Bank
 ```
 
-### 下一优先级: Phase 0.8 R2 — 多故障 + 参数调优 🟦
+### Phase 0.8 R4: NMS 与 Prediction–Target 一对一匹配 🟩
+
+**目标**: 一条 Query 只运行一次 prior-only inference、只生成一次 joint `S[t,c]`，NMS 根据查询文本故障数输出多个候选，evaluation 改为真正的一对一匹配。
+
+| # | 任务 | 状态 |
+|---|------|------|
+| 0.8.4.1 | `phaseA_run_inference.py` 主路径使用单次 episode / 单次 inference / 单次 joint matrix / 单次 `decode_multiple_faults()` | 🟩 |
+| 0.8.4.2 | `max_faults` 仅来自 `InferenceQuery.expected_fault_count` | 🟩 |
+| 0.8.4.3 | 删除预测不足时复用同一峰值的 fallback | 🟩 |
+| 0.8.4.4 | `phaseA_evaluate_predictions.py` 新增 `match_predictions_to_targets()` 贪心一对一匹配 | 🟩 |
+| 0.8.4.5 | evaluation 删除按数组下标硬匹配；未匹配 GT 计为 miss | 🟩 |
+| 0.8.4.6 | 单元测试：顺序无关匹配 + `expected_fault_count=2` 时最多输出 2 个候选 | 🟩 |
+
+**实现说明**:
+- 推理路径不导入 `EvalTarget`，也不读取 `gt_fault_count`、`len(eval_target.root_causes)` 或 `scoring_points` 中的根因数量。
+- evaluation 使用匹配代价 `component_mismatch_penalty + time_distance_minutes` 的 greedy matching。
+- 若预测数少于 GT 数，未匹配目标直接记为 miss，不再复用同一个峰值补位。
+
+### 下一优先级: Phase 0.8 R5 — 待定 🟦
 
 ---
 

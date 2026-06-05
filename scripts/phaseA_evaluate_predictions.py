@@ -1,18 +1,18 @@
-"""Phase 0.8 Round 1: Evaluation-only script — reads predictions.json + GT.
+"""Phase 0.8 Round 4: Evaluation script — reads predictions.json + GT.
 
 This script reads:
   - predictions.json (from phaseA_run_inference.py)
   - query.csv scoring_points column (via load_eval_targets)
   - record.csv (for label matching)
 
-It supports single-fault evaluation only (matching the current strict_eval logic).
-Do NOT process multi-fault matching in this round.
+It evaluates multi-fault queries with one-to-one prediction/target matching.
 """
 
 import json
 import os
 import sys
 import argparse
+from datetime import datetime as dt
 
 import numpy as np
 
@@ -88,39 +88,172 @@ def _extract_labels(data_dir, entity_ids, adapter):
     return labels
 
 
-def _match_eval_label(eval_target, labels):
+def _normalize_component_name(name):
+    return str(name).lower().replace("_", "").replace("-", "").replace(" ", "")
+
+
+def _resolve_component_idx(component_name, entity_ids):
+    if not component_name:
+        return -1
+    if component_name in entity_ids:
+        return entity_ids.index(component_name)
+
+    comp_norm = _normalize_component_name(component_name)
+    for idx, entity_id in enumerate(entity_ids):
+        entity_norm = _normalize_component_name(entity_id)
+        if comp_norm and entity_norm and (comp_norm in entity_norm or entity_norm in comp_norm):
+            return idx
+    return -1
+
+
+def _parse_prediction(prediction, entity_ids):
+    pred_dt_str = prediction.get("datetime", "")
+    pred_ts = None
+    if pred_dt_str:
+        try:
+            pred_dt = dt.strptime(pred_dt_str, "%Y-%m-%d %H:%M:%S")
+            pred_ts = pred_dt.replace(tzinfo=OPENRCA_TZ).timestamp()
+        except (ValueError, OSError):
+            pred_ts = None
+
+    pred_component = prediction.get("component", "")
+    return {
+        "component": pred_component,
+        "component_idx": _resolve_component_idx(pred_component, entity_ids),
+        "timestamp": pred_ts,
+        "datetime": pred_dt_str,
+        "score": prediction.get("score"),
+        "raw": prediction,
+    }
+
+
+def _match_eval_targets(eval_target, labels):
     """Match EvalTarget root causes to record.csv labels. EVALUATION ONLY."""
     matched = []
-    for rc_idx, (comp, dt_str, reason, tolerance) in enumerate(eval_target.root_causes):
+    used_label_indices = set()
+
+    for comp, dt_str, reason, tolerance in eval_target.root_causes:
         found = None
+        found_idx = None
         if dt_str:
             try:
-                from datetime import datetime as dt
                 gt_dt = dt.strptime(dt_str, "%Y-%m-%d %H:%M:%S")
                 gt_ts = gt_dt.replace(tzinfo=OPENRCA_TZ).timestamp()
-                for lb in labels:
+                for lb_idx, lb in enumerate(labels):
+                    if lb_idx in used_label_indices:
+                        continue
                     if abs(lb["timestamp"] - gt_ts) < 300:
                         found = lb
+                        found_idx = lb_idx
                         break
             except (ValueError, OSError):
                 pass
 
         if found is None and comp:
             cl = comp.lower().replace("_", "").replace("-", "").replace(" ", "")
-            for lb in labels:
+            for lb_idx, lb in enumerate(labels):
+                if lb_idx in used_label_indices:
+                    continue
                 lb_comp = lb["component"].lower().replace("_", "").replace("-", "").replace(" ", "")
                 if cl and lb_comp and (cl in lb_comp or lb_comp in cl):
                     found = lb
+                    found_idx = lb_idx
                     break
 
         if found is not None:
-            matched.append(found)
+            used_label_indices.add(found_idx)
+            matched.append({
+                "component": found["component"],
+                "component_idx": found["component_idx"],
+                "timestamp": found["timestamp"],
+                "reason": found["reason"],
+                "tolerance": tolerance,
+                "target_component": comp,
+                "target_datetime": dt_str,
+                "target_reason": reason,
+            })
 
     return matched
 
 
+def _matching_cost(prediction, target, component_mismatch_penalty=10000.0):
+    cost = 0.0
+    if prediction.get("component_idx", -1) != target.get("component_idx", -1):
+        cost += component_mismatch_penalty
+
+    pred_ts = prediction.get("timestamp")
+    target_ts = target.get("timestamp")
+    if pred_ts is None or target_ts is None:
+        cost += component_mismatch_penalty
+    else:
+        cost += abs(pred_ts - target_ts) / 60.0
+    return cost
+
+
+def match_predictions_to_targets(predictions, targets):
+    """Greedy one-to-one matching between predictions and GT targets."""
+    unmatched_prediction_indices = list(range(len(predictions)))
+    unmatched_target_indices = list(range(len(targets)))
+    matched_pairs = []
+
+    while unmatched_prediction_indices and unmatched_target_indices:
+        best = None
+        for pred_idx in unmatched_prediction_indices:
+            for target_idx in unmatched_target_indices:
+                cost = _matching_cost(predictions[pred_idx], targets[target_idx])
+                candidate = (cost, pred_idx, target_idx)
+                if best is None or candidate < best:
+                    best = candidate
+
+        _, pred_idx, target_idx = best
+        matched_pairs.append({
+            "prediction": predictions[pred_idx],
+            "target": targets[target_idx],
+        })
+        unmatched_prediction_indices.remove(pred_idx)
+        unmatched_target_indices.remove(target_idx)
+
+    unmatched_predictions = [predictions[idx] for idx in unmatched_prediction_indices]
+    unmatched_targets = [targets[idx] for idx in unmatched_target_indices]
+    return matched_pairs, unmatched_predictions, unmatched_targets
+
+
+def _evaluate_prediction_target_pair(prediction, target, entity_ids):
+    gt_c = target["component_idx"]
+    gt_ts = target["timestamp"]
+    tolerance = target["tolerance"]
+
+    comp_hit = prediction is not None and prediction.get("component_idx", -1) == gt_c
+
+    time_hit = False
+    time_error_min = float('inf')
+    if prediction is not None and prediction.get("timestamp") is not None:
+        time_error_sec = abs(prediction["timestamp"] - gt_ts)
+        time_error_min = time_error_sec / 60.0
+        time_hit = time_error_sec <= tolerance * 60
+
+    comp_rank = 1 if comp_hit else len(entity_ids)
+    joint_hit = comp_hit and time_hit
+
+    return {
+        "component_rank": comp_rank,
+        "component_top1": comp_rank == 1,
+        "component_top3": comp_rank <= 3,
+        "time_error": float('nan') if time_error_min == float('inf') else time_error_min,
+        "time_error_min": time_error_min if time_error_min != float('inf') else float('nan'),
+        "time_hit": time_hit,
+        "time_hit_5min": bool(time_error_min <= 5.0),
+        "time_hit_10min": bool(time_error_min <= 10.0),
+        "time_hit_15min": bool(time_error_min <= 15.0),
+        "joint_component_hit": comp_hit,
+        "joint_time_hit": time_hit,
+        "joint_hit": joint_hit,
+        "reciprocal_rank": 1.0 / max(1, comp_rank),
+    }
+
+
 def evaluate_system(sys_name, predictions_by_id, resample_sec):
-    """Evaluate predictions for one system — single-fault only."""
+    """Evaluate predictions for one system with one-to-one prediction matching."""
     cfg = SYSTEM_CONFIGS[sys_name]
     data_dir = cfg["data_dir"]
     if not os.path.exists(data_dir):
@@ -149,101 +282,46 @@ def evaluate_system(sys_name, predictions_by_id, resample_sec):
 
     query_results = []
     processed = 0
-    skipped_no_pred = 0
     skipped_no_label = 0
 
     for qid, eval_tgt in eval_targets.items():
-        if qid not in predictions_by_id:
-            skipped_no_pred += 1
-            continue
+        pred_entry = predictions_by_id.get(qid, {"query_id": qid, "predictions": []})
+        raw_predictions = pred_entry.get("predictions", [])
 
-        pred_entry = predictions_by_id[qid]
-        predictions = pred_entry.get("predictions", [])
-
-        matched_labels = _match_eval_label(eval_tgt, labels)
-        if not matched_labels:
+        targets = _match_eval_targets(eval_tgt, labels)
+        if not targets:
             skipped_no_label += 1
             continue
 
-        gt_fault_count = len(eval_tgt.root_causes)
-        if gt_fault_count > 1:
-            skipped_no_label += 1
-            continue
+        predictions = [_parse_prediction(prediction, entity_ids) for prediction in raw_predictions]
+        matched_pairs, _, unmatched_targets = match_predictions_to_targets(predictions, targets)
 
-        # Single-fault evaluation
-        for rc_idx, lb in enumerate(matched_labels):
-            if rc_idx >= len(eval_tgt.root_causes):
-                break
-            _, _, _, tolerance = eval_tgt.root_causes[rc_idx]
-            gt_c = lb["component_idx"]
-            gt_ts = lb["timestamp"]
+        num_faults_in_query = len(targets)
+        for pair in matched_pairs:
+            metrics = _evaluate_prediction_target_pair(pair["prediction"], pair["target"], entity_ids)
+            metrics["num_faults_in_query"] = num_faults_in_query
+            metrics["query_window_coverage"] = 1.0
+            query_results.append(metrics)
 
-            # Determine predicted component and time
-            if rc_idx < len(predictions):
-                pred_component = predictions[rc_idx].get("component", "")
-                pred_dt_str = predictions[rc_idx].get("datetime", "")
-            else:
-                pred_component = ""
-                pred_dt_str = ""
+        for target in unmatched_targets:
+            metrics = _evaluate_prediction_target_pair(None, target, entity_ids)
+            metrics["num_faults_in_query"] = num_faults_in_query
+            metrics["query_window_coverage"] = 1.0
+            query_results.append(metrics)
 
-            # Component match: check if predicted component matches GT
-            comp_hit = False
-            if pred_component and gt_c < len(entity_ids):
-                comp_hit = pred_component == entity_ids[gt_c]
-                if not comp_hit:
-                    cl = pred_component.lower().replace("_", "").replace("-", "").replace(" ", "")
-                    gl = entity_ids[gt_c].lower().replace("_", "").replace("-", "").replace(" ", "")
-                    comp_hit = bool(cl and gl and (cl in gl or gl in cl))
-
-            # Time match: check if predicted datetime is within tolerance
-            time_hit = False
-            time_error_min = float('inf')
-            if pred_dt_str:
-                try:
-                    from datetime import datetime as dt
-                    pred_dt = dt.strptime(pred_dt_str, "%Y-%m-%d %H:%M:%S")
-                    pred_ts = pred_dt.replace(tzinfo=OPENRCA_TZ).timestamp()
-                    time_error_sec = abs(pred_ts - gt_ts)
-                    time_error_min = time_error_sec / 60.0
-                    time_hit = time_error_sec <= tolerance * 60
-                except (ValueError, OSError):
-                    pass
-
-            # Component rank: 1 if match else len(entities) worst case
-            comp_rank = 1 if comp_hit else len(entity_ids)
-
-            joint_hit = comp_hit and time_hit
-
-            query_results.append({
-                "component_rank": comp_rank,
-                "component_top1": comp_rank == 1,
-                "component_top3": comp_rank <= 3,
-                "time_error": float('nan') if time_error_min == float('inf') else time_error_min,
-                "time_error_min": time_error_min if time_error_min != float('inf') else float('nan'),
-                "time_hit": time_hit,
-                "time_hit_5min": bool(time_error_min <= 5.0),
-                "time_hit_10min": bool(time_error_min <= 10.0),
-                "time_hit_15min": bool(time_error_min <= 15.0),
-                "joint_component_hit": comp_hit,
-                "joint_time_hit": time_hit,
-                "joint_hit": joint_hit,
-                "reciprocal_rank": 1.0 / max(1, comp_rank),
-                "num_faults_in_query": gt_fault_count,
-                "query_window_coverage": 1.0,
-            })
         processed += 1
 
     num_root_causes = len(query_results)
-    skipped = skipped_no_pred + skipped_no_label
+    skipped = skipped_no_label
     print(f"  Evaluated queries: {processed} | "
           f"Total root-causes: {num_root_causes} | "
-          f"Skipped: {skipped} (no_pred: {skipped_no_pred}, no_label: {skipped_no_label})")
+          f"Skipped: {skipped} (no_label: {skipped_no_label})")
 
     agg = aggregate_metrics(query_results)
     agg["total_official"] = len(eval_targets)
     agg["n_queries_evaluated"] = processed
     agg["n_queries_skipped"] = skipped
-    agg["n_queries_skipped_no_pred"] = skipped_no_pred
+    agg["n_queries_skipped_no_pred"] = 0
     agg["n_queries_skipped_no_label"] = skipped_no_label
     return agg
 
@@ -268,7 +346,7 @@ def main():
     print(f"Loaded {len(predictions_by_id)} prediction entries from {args.predictions}")
 
     print("=" * 60)
-    print("Phase 0.8 R1: Evaluation-only (reads predictions.json + scoring_points + record.csv)")
+    print("Phase 0.8 R4: Evaluation (one-to-one matching over predictions.json + GT)")
     print("=" * 60)
 
     all_results = {}
