@@ -110,7 +110,7 @@ _TIME_RANGE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _GT_TIME_PATTERN = re.compile(
-    r'root cause occurrence time is within\s+(\d+)\s+minutes.*?of\s+(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})',
+    r'(?:The\s+(?:(\d+)-th\s+)?predicted\s+)?root cause occurrence time is within\s+(\d+)\s+minutes?.*?of\s+(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})',
     re.IGNORECASE,
 )
 _GT_COMPONENT_PATTERN = re.compile(
@@ -183,32 +183,33 @@ def parse_time_range_from_text(text: str) -> Optional[Tuple[int, int, int, int]]
     return int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4))
 
 
-def _parse_gt_time(scoring_points: str) -> Tuple[str, int]:
-    m = _GT_TIME_PATTERN.search(scoring_points)
-    if m:
-        return m.group(2), int(m.group(1))
-    return "", 1
+def _parse_gt_times(scoring_points: str) -> Dict[int, Tuple[str, int]]:
+    gt_times: Dict[int, Tuple[str, int]] = {}
+    for m in _GT_TIME_PATTERN.finditer(scoring_points):
+        idx = int(m.group(1)) if m.group(1) else len(gt_times) + 1
+        gt_times[idx] = (m.group(3), int(m.group(2)))
+    return gt_times
 
 
-def _parse_gt_components(scoring_points: str) -> List[str]:
-    components = []
+def _parse_gt_components(scoring_points: str) -> Dict[int, str]:
+    components: Dict[int, str] = {}
     for m in _MULTI_COMPONENT_PATTERN.finditer(scoring_points):
-        components.append(m.group(2).strip())
+        components[int(m.group(1))] = m.group(2).strip()
     if not components:
         m = _GT_COMPONENT_PATTERN.search(scoring_points)
         if m:
-            components.append(m.group(1).strip())
+            components[1] = m.group(1).strip()
     return components
 
 
-def _parse_gt_reasons(scoring_points: str) -> List[str]:
-    reasons = []
+def _parse_gt_reasons(scoring_points: str) -> Dict[int, str]:
+    reasons: Dict[int, str] = {}
     for m in _MULTI_REASON_PATTERN.finditer(scoring_points):
-        reasons.append(m.group(2).strip())
+        reasons[int(m.group(1))] = m.group(2).strip()
     if not reasons:
         m = _GT_REASON_PATTERN.search(scoring_points)
         if m:
-            reasons.append(m.group(1).strip())
+            reasons[1] = m.group(1).strip()
     return reasons
 
 
@@ -294,17 +295,21 @@ def _parse_scoring_to_eval_target(task: str, scoring: str, idx: int) -> EvalTarg
     need_component = fields.get("need_component", True)
     need_reason = fields.get("need_reason", True)
 
-    gt_datetime, gt_tolerance = _parse_gt_time(scoring)
+    gt_times = _parse_gt_times(scoring)
     gt_components = _parse_gt_components(scoring)
     gt_reasons = _parse_gt_reasons(scoring)
-    gt_fault_count = max(len(gt_components), len(gt_reasons), 1)
+    root_cause_indices = sorted(
+        set(gt_times) | set(gt_components) | set(gt_reasons)
+    )
+    if not root_cause_indices:
+        root_cause_indices = [1]
 
     root_causes = []
-    for fi in range(gt_fault_count):
-        comp = gt_components[fi] if fi < len(gt_components) else ""
-        dt_str = gt_datetime if fi == 0 else ""
-        reason = gt_reasons[fi] if fi < len(gt_reasons) else ""
-        root_causes.append((comp, dt_str, reason, gt_tolerance))
+    for rc_idx in root_cause_indices:
+        comp = gt_components.get(rc_idx, "")
+        dt_str, tolerance = gt_times.get(rc_idx, ("", 1))
+        reason = gt_reasons.get(rc_idx, "")
+        root_causes.append((comp, dt_str, reason, tolerance))
 
     return EvalTarget(
         query_id=idx,

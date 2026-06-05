@@ -9,7 +9,11 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from foundation.evaluation.query_parser import parse_fault_count, parse_inference_queries
+from foundation.evaluation.query_parser import (
+    load_eval_targets,
+    parse_fault_count,
+    parse_inference_queries,
+)
 
 
 INSTRUCTION = (
@@ -87,6 +91,53 @@ class ParseInferenceQueriesGtIsolationTest(unittest.TestCase):
         self.assertEqual(parse_fault_count("number of failures: 3"), 3)
         self.assertEqual(parse_fault_count("a single failure"), 1)
         self.assertEqual(parse_fault_count("unknown text"), 1)
+
+    def test_load_eval_targets_parses_each_root_cause_time(self):
+        scoring_points = "\n".join([
+            "The 1-th predicted root cause occurrence time is within 1 minutes of 2024-01-01 01:10:00",
+            "The 1-th predicted root cause component is service_a",
+            "The 1-th predicted root cause reason is cpu saturation",
+            "The 2-th predicted root cause occurrence time is within 2 minutes of 2024-01-01 01:20:00",
+            "The 2-th predicted root cause component is service_b",
+            "The 2-th predicted root cause reason is disk latency",
+            "The 3-th predicted root cause occurrence time is within 3 minutes of 2024-01-01 01:30:00",
+            "The 3-th predicted root cause component is service_c",
+            "The 3-th predicted root cause reason is network loss",
+        ])
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            query_csv = Path(tmpdir) / "query.csv"
+            write_query_csv(
+                query_csv,
+                ["task_index", "instruction", "scoring_points"],
+                {
+                    "task_index": "task_7",
+                    "instruction": INSTRUCTION,
+                    "scoring_points": scoring_points,
+                },
+            )
+
+            eval_targets = load_eval_targets(str(query_csv))
+
+            root_causes = eval_targets[0].root_causes
+            self.assertEqual(len(root_causes), 3)
+            self.assertEqual(
+                [rc[1] for rc in root_causes],
+                [
+                    "2024-01-01 01:10:00",
+                    "2024-01-01 01:20:00",
+                    "2024-01-01 01:30:00",
+                ],
+            )
+            self.assertTrue(all(rc[1] for rc in root_causes))
+            self.assertEqual(
+                root_causes,
+                [
+                    ("service_a", "2024-01-01 01:10:00", "cpu saturation", 1),
+                    ("service_b", "2024-01-01 01:20:00", "disk latency", 2),
+                    ("service_c", "2024-01-01 01:30:00", "network loss", 3),
+                ],
+            )
 
 
 if __name__ == "__main__":
