@@ -154,6 +154,51 @@ def compute_residuals_and_latents(model, params, tensor_norm, type_idx,
     return np.nan_to_num(resid_acc, nan=0.0), h_acc, coverage
 
 
+def serialize_prediction_item(iq, dt, component, score):
+    """Serialize a single prediction item respecting Query Mask.
+
+    Args:
+        iq: InferenceQuery with need_time/need_component/need_reason.
+        dt: Formatted datetime string.
+        component: Component name string.
+        score: Float score.
+
+    Returns:
+        dict with score (always), plus datetime/component as needed.
+        Reason is never output (not yet supported).
+    """
+    item = {"score": round(float(score), 6)}
+    if iq.need_time:
+        item["datetime"] = dt
+    if iq.need_component:
+        item["component"] = component
+    return item
+
+
+def build_prediction_entry(system, query_id, predictions, component_ranking, iq):
+    """Build a query-level prediction entry for predictions.json.
+
+    Args:
+        system: System name string.
+        query_id: Integer query ID.
+        predictions: List of per-fault prediction dicts.
+        component_ranking: List of (component_name, score) tuples sorted desc.
+        iq: InferenceQuery with query mask flags.
+
+    Returns:
+        dict ready for JSON serialization.
+    """
+    return {
+        "system": system,
+        "query_id": int(query_id),
+        "predictions": predictions,
+        "component_ranking": component_ranking,
+        "need_time": iq.need_time,
+        "need_component": iq.need_component,
+        "need_reason": iq.need_reason,
+    }
+
+
 def run_inference(sys_name, model, state, ob_mean, ob_std, use_posterior,
                   scoring_method, all_zero_type, burn_in_min, resample_sec):
     """Run inference for one system — ZERO GT access."""
@@ -283,12 +328,7 @@ def run_inference(sys_name, model, state, ob_mean, ob_std, use_posterior,
         for pt, pc, pscore in predictions:
             dt = datetime.fromtimestamp(ts_sub[pt], tz=OPENRCA_TZ).strftime("%Y-%m-%d %H:%M:%S")
             comp_name = entity_ids[pc] if pc < len(entity_ids) else f"entity_{pc}"
-            item = {"score": round(float(pscore), 6)}
-            if iq.need_time:
-                item["datetime"] = dt
-            if iq.need_component:
-                item["component"] = comp_name
-            pred_list.append(item)
+            pred_list.append(serialize_prediction_item(iq, dt, comp_name, pscore))
 
         comp_scores = joint.component_score  # [N]
         component_ranking = sorted(
@@ -296,15 +336,8 @@ def run_inference(sys_name, model, state, ob_mean, ob_std, use_posterior,
             key=lambda x: x[1], reverse=True,
         )
 
-        all_predictions.append({
-            "system": sys_name,
-            "query_id": int(qid),
-            "predictions": pred_list,
-            "component_ranking": component_ranking,
-            "need_time": iq.need_time,
-            "need_component": iq.need_component,
-            "need_reason": iq.need_reason,
-        })
+        all_predictions.append(
+            build_prediction_entry(sys_name, qid, pred_list, component_ranking, iq))
         processed += 1
 
         if (qi + 1) % 30 == 0:

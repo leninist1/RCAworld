@@ -1,4 +1,5 @@
 import csv
+import json
 import sys
 import tempfile
 import unittest
@@ -17,6 +18,9 @@ from foundation.evaluation.strict_eval import JointScores
 from phaseA_evaluate_predictions import (
     match_predictions_to_targets, _build_eval_targets,
     _evaluate_prediction_target_pair, _aggregate_by_applicability,
+)
+from phaseA_run_inference import (
+    serialize_prediction_item, build_prediction_entry,
 )
 
 
@@ -544,22 +548,21 @@ class PhaseAQueryMaskSerializationTest(unittest.TestCase):
             "Please identify the component."
         )
         query_csv_path = self._write_query_csv("task_3", instruction)
-        queries = parse_inference_queries(query_csv_path)
-        iq = queries[0]
+        iq = parse_inference_queries(query_csv_path)[0]
 
         self.assertTrue(iq.need_component)
         self.assertFalse(iq.need_time)
         self.assertFalse(iq.need_reason)
 
-        item = {"score": 0.95}
-        if iq.need_time:
-            item["datetime"] = "2024-01-01 09:12:00"
-        if iq.need_component:
-            item["component"] = "mysql01"
+        item = serialize_prediction_item(
+            iq, dt="2024-01-01 09:12:00", component="mysql01", score=0.95)
+        item_json = json.loads(json.dumps(item))
 
-        self.assertIn("component", item)
-        self.assertNotIn("datetime", item)
-        self.assertNotIn("reason", item)
+        self.assertIn("component", item_json)
+        self.assertNotIn("datetime", item_json)
+        self.assertNotIn("reason", item_json)
+        self.assertEqual(item_json["component"], "mysql01")
+        self.assertIn("score", item_json)
 
     def test_time_only_query_prediction_has_datetime_not_component(self):
         instruction = (
@@ -567,22 +570,21 @@ class PhaseAQueryMaskSerializationTest(unittest.TestCase):
             "Please identify the occurrence time."
         )
         query_csv_path = self._write_query_csv("task_1", instruction)
-        queries = parse_inference_queries(query_csv_path)
-        iq = queries[0]
+        iq = parse_inference_queries(query_csv_path)[0]
 
         self.assertTrue(iq.need_time)
         self.assertFalse(iq.need_component)
         self.assertFalse(iq.need_reason)
 
-        item = {"score": 0.95}
-        if iq.need_time:
-            item["datetime"] = "2024-01-01 09:12:00"
-        if iq.need_component:
-            item["component"] = "mysql01"
+        item = serialize_prediction_item(
+            iq, dt="2024-01-01 09:12:00", component="mysql01", score=0.95)
+        item_json = json.loads(json.dumps(item))
 
-        self.assertIn("datetime", item)
-        self.assertNotIn("component", item)
-        self.assertNotIn("reason", item)
+        self.assertIn("datetime", item_json)
+        self.assertNotIn("component", item_json)
+        self.assertNotIn("reason", item_json)
+        self.assertEqual(item_json["datetime"], "2024-01-01 09:12:00")
+        self.assertIn("score", item_json)
 
     def test_time_component_query_prediction_has_both_not_reason(self):
         instruction = (
@@ -590,22 +592,22 @@ class PhaseAQueryMaskSerializationTest(unittest.TestCase):
             "Please identify the occurrence time and component."
         )
         query_csv_path = self._write_query_csv("task_5", instruction)
-        queries = parse_inference_queries(query_csv_path)
-        iq = queries[0]
+        iq = parse_inference_queries(query_csv_path)[0]
 
         self.assertTrue(iq.need_time)
         self.assertTrue(iq.need_component)
         self.assertFalse(iq.need_reason)
 
-        item = {"score": 0.95}
-        if iq.need_time:
-            item["datetime"] = "2024-01-01 09:12:00"
-        if iq.need_component:
-            item["component"] = "mysql01"
+        item = serialize_prediction_item(
+            iq, dt="2024-01-01 09:12:00", component="mysql01", score=0.95)
+        item_json = json.loads(json.dumps(item))
 
-        self.assertIn("datetime", item)
-        self.assertIn("component", item)
-        self.assertNotIn("reason", item)
+        self.assertIn("datetime", item_json)
+        self.assertIn("component", item_json)
+        self.assertNotIn("reason", item_json)
+        self.assertEqual(item_json["datetime"], "2024-01-01 09:12:00")
+        self.assertEqual(item_json["component"], "mysql01")
+        self.assertIn("score", item_json)
 
     def test_query_level_result_contains_need_flags(self):
         instruction = (
@@ -613,28 +615,26 @@ class PhaseAQueryMaskSerializationTest(unittest.TestCase):
             "Please identify the occurrence time, component, and reason."
         )
         query_csv_path = self._write_query_csv("task_7", instruction)
-        queries = parse_inference_queries(query_csv_path)
-        iq = queries[0]
+        iq = parse_inference_queries(query_csv_path)[0]
 
         self.assertTrue(iq.need_time)
         self.assertTrue(iq.need_component)
         self.assertTrue(iq.need_reason)
 
-        entry = {
-            "system": "Bank",
-            "query_id": int(iq.query_id),
-            "predictions": [],
-            "component_ranking": [],
-            "need_time": iq.need_time,
-            "need_component": iq.need_component,
-            "need_reason": iq.need_reason,
-        }
+        preds = [serialize_prediction_item(
+            iq, dt="2024-01-01 09:12:00", component="mysql01", score=0.95)]
+        entry = build_prediction_entry(
+            system="Bank", query_id=iq.query_id,
+            predictions=preds, component_ranking=[], iq=iq)
+        entry_json = json.loads(json.dumps(entry))
 
-        self.assertTrue(entry["need_time"])
-        self.assertTrue(entry["need_component"])
-        self.assertTrue(entry["need_reason"])
-        self.assertNotIn("reason", entry.get("predictions", [{}])[0]
-                         if entry.get("predictions") else {})
+        self.assertTrue(entry_json["need_time"])
+        self.assertTrue(entry_json["need_component"])
+        self.assertTrue(entry_json["need_reason"])
+        self.assertEqual(entry_json["system"], "Bank")
+        self.assertEqual(entry_json["query_id"], iq.query_id)
+        self.assertIsInstance(entry_json["predictions"], list)
+        self.assertIsInstance(entry_json["component_ranking"], list)
 
 
 if __name__ == "__main__":
