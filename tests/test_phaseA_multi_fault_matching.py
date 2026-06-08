@@ -22,6 +22,9 @@ from phaseA_evaluate_predictions import (
 from phaseA_run_inference import (
     serialize_prediction_item, build_prediction_entry,
 )
+from phaseA_export_openrca_csv import (
+    build_export_rows, export_prediction_csv, ExportError, _validate_entry,
+)
 
 
 def _ts(dt_str):
@@ -635,6 +638,124 @@ class PhaseAQueryMaskSerializationTest(unittest.TestCase):
         self.assertEqual(entry_json["query_id"], iq.query_id)
         self.assertIsInstance(entry_json["predictions"], list)
         self.assertIsInstance(entry_json["component_ranking"], list)
+
+
+class PhaseAOpenRCAExportTest(unittest.TestCase):
+    def test_component_only_query_exports_component_not_time_or_reason(self):
+        entry = {
+            "system": "Bank",
+            "query_id": 0,
+            "need_time": False,
+            "need_component": True,
+            "need_reason": False,
+            "predictions": [
+                {"score": 0.95, "component": "mysql01"},
+            ],
+        }
+        rows = build_export_rows(entry)
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row["query_id"], 0)
+        self.assertEqual(row["component"], "mysql01")
+        self.assertNotIn("occurrence_time", row)
+
+    def test_time_only_query_exports_time_not_component_or_reason(self):
+        entry = {
+            "system": "Telecom",
+            "query_id": 1,
+            "need_time": True,
+            "need_component": False,
+            "need_reason": False,
+            "predictions": [
+                {"score": 0.88, "datetime": "2024-01-01 09:12:00"},
+            ],
+        }
+        rows = build_export_rows(entry)
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row["query_id"], 1)
+        self.assertEqual(row["occurrence_time"], "2024-01-01 09:12:00")
+        self.assertNotIn("component", row)
+
+    def test_time_component_query_exports_both(self):
+        entry = {
+            "system": "Bank",
+            "query_id": 2,
+            "need_time": True,
+            "need_component": True,
+            "need_reason": False,
+            "predictions": [
+                {"score": 0.95, "datetime": "2024-01-01 09:12:00",
+                 "component": "mysql01"},
+            ],
+        }
+        rows = build_export_rows(entry)
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row["occurrence_time"], "2024-01-01 09:12:00")
+        self.assertEqual(row["component"], "mysql01")
+
+    def test_multifault_time_component_sorted_by_datetime_ascending(self):
+        entry = {
+            "system": "Bank",
+            "query_id": 3,
+            "need_time": True,
+            "need_component": True,
+            "need_reason": False,
+            "predictions": [
+                {"score": 0.85, "datetime": "2024-01-01 09:40:00",
+                 "component": "redis01"},
+                {"score": 0.95, "datetime": "2024-01-01 09:12:00",
+                 "component": "mysql01"},
+            ],
+        }
+        rows = build_export_rows(entry)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["component"], "mysql01")
+        self.assertEqual(rows[0]["occurrence_time"], "2024-01-01 09:12:00")
+        self.assertEqual(rows[1]["component"], "redis01")
+        self.assertEqual(rows[1]["occurrence_time"], "2024-01-01 09:40:00")
+
+    def test_reason_only_query_rejected_as_unsupported(self):
+        entry = {
+            "system": "Bank",
+            "query_id": 4,
+            "need_time": False,
+            "need_component": False,
+            "need_reason": True,
+            "predictions": [
+                {"score": 0.90},
+            ],
+        }
+        with self.assertRaises(ExportError) as ctx:
+            build_export_rows(entry)
+        self.assertIn("not supported", str(ctx.exception))
+
+    def test_missing_required_field_raises_export_error(self):
+        entry = {
+            "system": "Bank",
+            "query_id": 5,
+            "need_time": False,
+            "need_component": True,
+            "need_reason": False,
+            "predictions": [
+                {"score": 0.95},
+            ],
+        }
+        with self.assertRaises(ExportError) as ctx:
+            build_export_rows(entry)
+        self.assertIn("component", str(ctx.exception))
+
+    def test_old_format_missing_system_raises_error(self):
+        entry = {
+            "query_id": 6,
+            "need_time": False,
+            "need_component": True,
+            "need_reason": False,
+            "predictions": [],
+        }
+        with self.assertRaises(ExportError):
+            _validate_entry(entry, 0)
 
 
 if __name__ == "__main__":
