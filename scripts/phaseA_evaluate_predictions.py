@@ -26,8 +26,6 @@ from foundation.evaluation.query_parser import (
     OPENRCA_TZ,
 )
 
-from foundation.evaluation.strict_eval import aggregate_metrics
-
 OPENRCA = "/home/dell2/RCA513/yyx/OpenRCA"
 
 SYSTEM_CONFIGS = {
@@ -286,6 +284,74 @@ def _evaluate_prediction_target_pair(prediction, target, entity_ids,
         "joint_time_hit": time_hit,
         "joint_hit": joint_hit,
         "reciprocal_rank": 1.0 / max(1, comp_rank),
+        "component_applicable": need_component,
+        "time_applicable": need_time,
+        "joint_applicable": (need_component and need_time),
+    }
+
+
+def _aggregate_by_applicability(query_results):
+    """Aggregate metrics with separate denominators by task type.
+
+    - Component metrics (Top-1, Top-3, MRR): only component_applicable results.
+    - Time metrics (Hit@5/10/15, MAE): only time_applicable results.
+    - Joint metrics: only joint_applicable results.
+    - Resolved-only variants: exclude unresolved from each subset.
+    - Time MAE: only valid finite values from time_applicable results.
+
+    Returns dict with all metrics, resolved-only, and denominator counts.
+    """
+    def _mean(items, key):
+        if not items:
+            return 0.0
+        vals = [r[key] for r in items]
+        return float(np.mean(vals))
+
+    def _time_mae(items):
+        valid = [r["time_error_min"] for r in items
+                 if not np.isnan(r["time_error_min"]) and np.isfinite(r["time_error_min"])]
+        if not valid:
+            return 0.0
+        return float(np.mean(valid))
+
+    def _time_hit(items, key):
+        if not items:
+            return 0.0
+        return float(np.mean([r[key] for r in items]))
+
+    component_results = [r for r in query_results if r.get("component_applicable", True)]
+    time_results = [r for r in query_results if r.get("time_applicable", True)]
+    joint_results = [r for r in query_results if r.get("joint_applicable", False)]
+    resolved_all = [r for r in query_results if not r.get("unresolved", False)]
+    resolved_component = [r for r in resolved_all if r.get("component_applicable", True)]
+    resolved_time = [r for r in resolved_all if r.get("time_applicable", True)]
+    resolved_joint = [r for r in resolved_all if r.get("joint_applicable", False)]
+
+    return {
+        "n": len(query_results),
+        "n_resolved": len(resolved_all),
+        "component_metric_count": len(component_results),
+        "time_metric_count": len(time_results),
+        "joint_metric_count": len(joint_results),
+        "resolved_component_count": len(resolved_component),
+        "resolved_time_count": len(resolved_time),
+        "resolved_joint_count": len(resolved_joint),
+
+        "component_top1": _mean(component_results, "component_top1"),
+        "component_top3": _mean(component_results, "component_top3"),
+        "mrr": _mean(component_results, "reciprocal_rank"),
+        "avg_rank": _mean(component_results, "component_rank"),
+
+        "time_hit_5min": _time_hit(time_results, "time_hit_5min"),
+        "time_hit_10min": _time_hit(time_results, "time_hit_10min"),
+        "time_hit_15min": _time_hit(time_results, "time_hit_15min"),
+        "time_mae_min": _time_mae(time_results),
+
+        "joint_hit_rate": _mean(joint_results, "joint_hit"),
+
+        "resolved_component_top1": _mean(resolved_component, "component_top1"),
+        "resolved_component_top3": _mean(resolved_component, "component_top3"),
+        "resolved_mrr": _mean(resolved_component, "reciprocal_rank"),
     }
 
 
@@ -406,7 +472,6 @@ def evaluate_system(sys_name, predictions_by_key, resample_sec):
                 metrics["num_faults_in_query"] = num_faults_in_query
                 metrics["unresolved"] = True
                 query_results.append(metrics)
-            total_unresolved_rc += unresolved_count
             continue
 
         matched_pairs, unmatched_predictions, unmatched_targets = \
@@ -462,8 +527,8 @@ def evaluate_system(sys_name, predictions_by_key, resample_sec):
           f"unmatched: {total_unmatched_rc}")
 
     resolved_results = [r for r in query_results if not r.get("unresolved", False)]
-    agg_all = aggregate_metrics(query_results)
-    agg_resolved = aggregate_metrics(resolved_results) if resolved_results else {"n": 0}
+    agg_all = _aggregate_by_applicability(query_results)
+    agg_resolved = _aggregate_by_applicability(resolved_results) if resolved_results else {"n": 0}
 
     agg = {
         "official_query_count": official_query_count,
@@ -476,8 +541,11 @@ def evaluate_system(sys_name, predictions_by_key, resample_sec):
         "predicted_root_cause_count": total_predicted_rc,
         "matched_root_cause_count": total_matched_rc,
         "unmatched_root_cause_count": total_unmatched_rc,
-        "n": len(query_results),
-        "n_resolved": len(resolved_results),
+        "n": agg_all.get("n", 0),
+        "n_resolved": agg_all.get("n_resolved", 0),
+        "component_metric_count": agg_all.get("component_metric_count", 0),
+        "time_metric_count": agg_all.get("time_metric_count", 0),
+        "joint_metric_count": agg_all.get("joint_metric_count", 0),
         "component_top1": agg_all.get("component_top1", 0),
         "component_top3": agg_all.get("component_top3", 0),
         "mrr": agg_all.get("mrr", 0),
@@ -489,9 +557,9 @@ def evaluate_system(sys_name, predictions_by_key, resample_sec):
         "time_hit_10min": agg_all.get("time_hit_10min", 0),
         "time_hit_15min": agg_all.get("time_hit_15min", 0),
         "joint_hit_rate": agg_all.get("joint_hit_rate", 0),
-        "resolved_component_top1": agg_resolved.get("component_top1", 0),
-        "resolved_component_top3": agg_resolved.get("component_top3", 0),
-        "resolved_mrr": agg_resolved.get("mrr", 0),
+        "resolved_component_top1": agg_all.get("resolved_component_top1", 0),
+        "resolved_component_top3": agg_all.get("resolved_component_top3", 0),
+        "resolved_mrr": agg_all.get("resolved_mrr", 0),
     }
     return agg, skipped_queries
 

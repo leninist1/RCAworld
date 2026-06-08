@@ -16,7 +16,7 @@ from foundation.evaluation.query_parser import (
 from foundation.evaluation.strict_eval import JointScores
 from phaseA_evaluate_predictions import (
     match_predictions_to_targets, _build_eval_targets,
-    _evaluate_prediction_target_pair,
+    _evaluate_prediction_target_pair, _aggregate_by_applicability,
 )
 
 
@@ -360,6 +360,112 @@ class CrossSystemQueryIdIsolationTest(unittest.TestCase):
         }
         missing_system = [p for p in [old_entry] if "system" not in p]
         self.assertEqual(len(missing_system), 1)
+
+
+class PhaseAApplicabilityFilteringTest(unittest.TestCase):
+    def test_all_unresolved_query_counts_unresolved_once_not_double(self):
+        query_results = [
+            {"component_rank": 4, "component_top1": False, "component_top3": False,
+             "reciprocal_rank": 0.25, "component_applicable": True,
+             "time_applicable": True, "joint_applicable": True, "unresolved": True,
+             "time_error_min": float('nan'), "time_hit": False,
+             "time_hit_5min": False, "time_hit_10min": False, "time_hit_15min": False,
+             "joint_hit": False},
+            {"component_rank": 4, "component_top1": False, "component_top3": False,
+             "reciprocal_rank": 0.25, "component_applicable": True,
+             "time_applicable": True, "joint_applicable": True, "unresolved": True,
+             "time_error_min": float('nan'), "time_hit": False,
+             "time_hit_5min": False, "time_hit_10min": False, "time_hit_15min": False,
+             "joint_hit": False},
+            {"component_rank": 4, "component_top1": False, "component_top3": False,
+             "reciprocal_rank": 0.25, "component_applicable": True,
+             "time_applicable": True, "joint_applicable": True, "unresolved": True,
+             "time_error_min": float('nan'), "time_hit": False,
+             "time_hit_5min": False, "time_hit_10min": False, "time_hit_15min": False,
+             "joint_hit": False},
+        ]
+        agg = _aggregate_by_applicability(query_results)
+        self.assertEqual(agg["n"], 3)
+        self.assertEqual(agg["n_resolved"], 0)
+        self.assertEqual(agg["component_top1"], 0.0)
+        self.assertEqual(agg["component_metric_count"], 3)
+
+    def test_time_only_query_not_in_component_metric_count(self):
+        query_results = [
+            {"component_rank": 1, "component_top1": True, "component_top3": True,
+             "reciprocal_rank": 1.0, "component_applicable": False,
+             "time_applicable": True, "joint_applicable": False, "unresolved": False,
+             "time_error_min": 2.5, "time_hit": True,
+             "time_hit_5min": True, "time_hit_10min": True, "time_hit_15min": True,
+             "joint_hit": False},
+        ]
+        agg = _aggregate_by_applicability(query_results)
+        self.assertEqual(agg["component_metric_count"], 0)
+        self.assertEqual(agg["time_metric_count"], 1)
+        self.assertEqual(agg["joint_metric_count"], 0)
+
+    def test_component_only_query_not_in_time_metric_count(self):
+        query_results = [
+            {"component_rank": 1, "component_top1": True, "component_top3": True,
+             "reciprocal_rank": 1.0, "component_applicable": True,
+             "time_applicable": False, "joint_applicable": False, "unresolved": False,
+             "time_error_min": float('nan'), "time_hit": False,
+             "time_hit_5min": False, "time_hit_10min": False, "time_hit_15min": False,
+             "joint_hit": False},
+        ]
+        agg = _aggregate_by_applicability(query_results)
+        self.assertEqual(agg["component_metric_count"], 1)
+        self.assertEqual(agg["time_metric_count"], 0)
+        self.assertEqual(agg["joint_metric_count"], 0)
+
+    def test_time_component_query_in_joint_metric_count(self):
+        query_results = [
+            {"component_rank": 1, "component_top1": True, "component_top3": True,
+             "reciprocal_rank": 1.0, "component_applicable": True,
+             "time_applicable": True, "joint_applicable": True, "unresolved": False,
+             "time_error_min": 1.5, "time_hit": True,
+             "time_hit_5min": True, "time_hit_10min": True, "time_hit_15min": True,
+             "joint_hit": True},
+        ]
+        agg = _aggregate_by_applicability(query_results)
+        self.assertEqual(agg["component_metric_count"], 1)
+        self.assertEqual(agg["time_metric_count"], 1)
+        self.assertEqual(agg["joint_metric_count"], 1)
+
+    def test_component_only_query_does_not_cause_time_mae_nan(self):
+        query_results = [
+            {"component_rank": 1, "component_top1": True, "component_top3": True,
+             "reciprocal_rank": 1.0, "component_applicable": True,
+             "time_applicable": False, "joint_applicable": False, "unresolved": False,
+             "time_error_min": float('nan'), "time_hit": False,
+             "time_hit_5min": False, "time_hit_10min": False, "time_hit_15min": False,
+             "joint_hit": False},
+        ]
+        agg = _aggregate_by_applicability(query_results)
+        self.assertEqual(agg["time_mae_min"], 0.0)
+        self.assertFalse(np.isnan(agg["time_mae_min"]))
+        self.assertEqual(agg["time_metric_count"], 0)
+
+    def test_unresolved_need_component_miss_in_main_component_metrics(self):
+        query_results = [
+            {"component_rank": 4, "component_top1": False, "component_top3": False,
+             "reciprocal_rank": 0.25, "component_applicable": True,
+             "time_applicable": True, "joint_applicable": True, "unresolved": True,
+             "time_error_min": float('nan'), "time_hit": False,
+             "time_hit_5min": False, "time_hit_10min": False, "time_hit_15min": False,
+             "joint_hit": False},
+            {"component_rank": 1, "component_top1": True, "component_top3": True,
+             "reciprocal_rank": 1.0, "component_applicable": True,
+             "time_applicable": True, "joint_applicable": True, "unresolved": False,
+             "time_error_min": 1.0, "time_hit": True,
+             "time_hit_5min": True, "time_hit_10min": True, "time_hit_15min": True,
+             "joint_hit": True},
+        ]
+        agg = _aggregate_by_applicability(query_results)
+        self.assertLess(agg["component_top1"], 1.0)
+        self.assertEqual(agg["component_metric_count"], 2)
+        self.assertEqual(agg["n_resolved"], 1)
+        self.assertEqual(agg["resolved_component_top1"], 1.0)
 
 
 if __name__ == "__main__":
