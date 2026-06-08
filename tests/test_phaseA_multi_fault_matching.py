@@ -10,9 +10,13 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
-from foundation.evaluation.query_parser import OPENRCA_TZ, parse_inference_queries
+from foundation.evaluation.query_parser import (
+    OPENRCA_TZ, EvalTarget, parse_inference_queries,
+)
 from foundation.evaluation.strict_eval import JointScores
-from phaseA_evaluate_predictions import match_predictions_to_targets
+from phaseA_evaluate_predictions import (
+    match_predictions_to_targets, _build_eval_targets,
+)
 
 
 def _ts(dt_str):
@@ -106,6 +110,66 @@ class PhaseAMultiFaultMatchingTest(unittest.TestCase):
 
         self.assertEqual(queries[0].expected_fault_count, 2)
         self.assertEqual(len(predictions), 2)
+
+
+class PhaseAEvalTargetConstructionTest(unittest.TestCase):
+    def test_build_eval_targets_not_influenced_by_record_csv_order(self):
+        entity_ids = ["mysql01", "redis01"]
+        eval_target = EvalTarget(
+            query_id=0,
+            root_causes=[
+                ("redis01", "2024-01-01 09:12:00", "network timeout", 5),
+            ],
+        )
+
+        targets, unresolved = _build_eval_targets(eval_target, entity_ids)
+
+        self.assertEqual(len(targets), 1)
+        self.assertEqual(len(unresolved), 0)
+        self.assertEqual(targets[0]["component"], "redis01")
+        self.assertEqual(targets[0]["component_idx"], 1)
+        expected_ts = _ts("2024-01-01 09:12:00")
+        self.assertAlmostEqual(targets[0]["timestamp"], expected_ts, places=1)
+        self.assertEqual(targets[0]["reason"], "network timeout")
+        self.assertEqual(targets[0]["tolerance"], 5)
+
+    def test_unresolved_component_goes_to_unresolved_not_silently_dropped(self):
+        entity_ids = ["mysql01", "redis01"]
+        eval_target = EvalTarget(
+            query_id=0,
+            root_causes=[
+                ("unknown_component_xyz", "2024-01-01 09:12:00",
+                 "some reason", 5),
+            ],
+        )
+
+        targets, unresolved = _build_eval_targets(eval_target, entity_ids)
+
+        self.assertEqual(len(targets), 0)
+        self.assertEqual(len(unresolved), 1)
+        self.assertEqual(
+            unresolved[0],
+            ("unknown_component_xyz", "2024-01-01 09:12:00",
+             "some reason", 5),
+        )
+
+    def test_unresolved_bad_datetime_goes_to_unresolved(self):
+        entity_ids = ["mysql01", "redis01"]
+        eval_target = EvalTarget(
+            query_id=0,
+            root_causes=[
+                ("mysql01", "", "some reason", 5),
+            ],
+        )
+
+        targets, unresolved = _build_eval_targets(eval_target, entity_ids)
+
+        self.assertEqual(len(targets), 0)
+        self.assertEqual(len(unresolved), 1)
+        self.assertEqual(
+            unresolved[0],
+            ("mysql01", "", "some reason", 5),
+        )
 
 
 if __name__ == "__main__":

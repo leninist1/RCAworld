@@ -127,53 +127,48 @@ def _parse_prediction(prediction, entity_ids):
     }
 
 
-def _match_eval_targets(eval_target, labels):
-    """Match EvalTarget root causes to record.csv labels. EVALUATION ONLY."""
-    matched = []
-    used_label_indices = set()
+def _build_eval_targets(eval_target, entity_ids):
+    """Build official eval targets directly from EvalTarget.root_causes.
+
+    Each root_cause is (component, datetime_str, reason, tolerance_min).
+    Targets are constructed directly from scoring_points — record.csv labels
+    are NOT used for component or timestamp decisions.
+
+    Returns:
+        targets: List of target dicts with component, component_idx, timestamp,
+                 reason, tolerance.
+        unresolved_targets: List of root_cause tuples that could not be resolved
+                            (unparseable datetime or unresolvable component).
+    """
+    targets = []
+    unresolved_targets = []
 
     for comp, dt_str, reason, tolerance in eval_target.root_causes:
-        found = None
-        found_idx = None
+        parsed_ts = None
         if dt_str:
             try:
                 gt_dt = dt.strptime(dt_str, "%Y-%m-%d %H:%M:%S")
-                gt_ts = gt_dt.replace(tzinfo=OPENRCA_TZ).timestamp()
-                for lb_idx, lb in enumerate(labels):
-                    if lb_idx in used_label_indices:
-                        continue
-                    if abs(lb["timestamp"] - gt_ts) < 300:
-                        found = lb
-                        found_idx = lb_idx
-                        break
+                parsed_ts = gt_dt.replace(tzinfo=OPENRCA_TZ).timestamp()
             except (ValueError, OSError):
                 pass
 
-        if found is None and comp:
-            cl = comp.lower().replace("_", "").replace("-", "").replace(" ", "")
-            for lb_idx, lb in enumerate(labels):
-                if lb_idx in used_label_indices:
-                    continue
-                lb_comp = lb["component"].lower().replace("_", "").replace("-", "").replace(" ", "")
-                if cl and lb_comp and (cl in lb_comp or lb_comp in cl):
-                    found = lb
-                    found_idx = lb_idx
-                    break
+        comp_idx = _resolve_component_idx(comp, entity_ids)
 
-        if found is not None:
-            used_label_indices.add(found_idx)
-            matched.append({
-                "component": found["component"],
-                "component_idx": found["component_idx"],
-                "timestamp": found["timestamp"],
-                "reason": found["reason"],
+        if parsed_ts is not None and comp_idx >= 0:
+            targets.append({
+                "component": comp,
+                "component_idx": comp_idx,
+                "timestamp": parsed_ts,
+                "reason": reason,
                 "tolerance": tolerance,
                 "target_component": comp,
                 "target_datetime": dt_str,
                 "target_reason": reason,
             })
+        else:
+            unresolved_targets.append((comp, dt_str, reason, tolerance))
 
-    return matched
+    return targets, unresolved_targets
 
 
 def _matching_cost(prediction, target, component_mismatch_penalty=10000.0):
@@ -278,19 +273,21 @@ def evaluate_system(sys_name, predictions_by_id, resample_sec):
     print(f"  Entities: {len(entity_ids)}")
 
     labels = _extract_labels(data_dir, entity_ids, adapter)
-    print(f"  Loaded {len(labels)} labels from record.csv")
+    print(f"  Loaded {len(labels)} labels from record.csv (diagnostic only)")
 
     query_results = []
     processed = 0
-    skipped_no_label = 0
+    skipped_no_target = 0
+    total_unresolved = 0
 
     for qid, eval_tgt in eval_targets.items():
         pred_entry = predictions_by_id.get(qid, {"query_id": qid, "predictions": []})
         raw_predictions = pred_entry.get("predictions", [])
 
-        targets = _match_eval_targets(eval_tgt, labels)
+        targets, unresolved = _build_eval_targets(eval_tgt, entity_ids)
+        total_unresolved += len(unresolved)
         if not targets:
-            skipped_no_label += 1
+            skipped_no_target += 1
             continue
 
         predictions = [_parse_prediction(prediction, entity_ids) for prediction in raw_predictions]
@@ -312,17 +309,19 @@ def evaluate_system(sys_name, predictions_by_id, resample_sec):
         processed += 1
 
     num_root_causes = len(query_results)
-    skipped = skipped_no_label
+    skipped = skipped_no_target
     print(f"  Evaluated queries: {processed} | "
           f"Total root-causes: {num_root_causes} | "
-          f"Skipped: {skipped} (no_label: {skipped_no_label})")
+          f"Skipped: {skipped} (no_target: {skipped_no_target}) | "
+          f"Unresolved: {total_unresolved}")
 
     agg = aggregate_metrics(query_results)
     agg["total_official"] = len(eval_targets)
     agg["n_queries_evaluated"] = processed
     agg["n_queries_skipped"] = skipped
     agg["n_queries_skipped_no_pred"] = 0
-    agg["n_queries_skipped_no_label"] = skipped_no_label
+    agg["n_queries_skipped_no_target"] = skipped_no_target
+    agg["n_unresolved_rc"] = total_unresolved
     return agg
 
 
