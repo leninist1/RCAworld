@@ -228,7 +228,7 @@ def match_predictions_to_targets(predictions, targets):
 
 def _evaluate_prediction_target_pair(prediction, target, entity_ids,
                                        component_ranking=None,
-                                       need_component=True, need_time=True):
+                                        need_component=True, need_time=True):
     """Evaluate one prediction-target pair with real component ranking.
 
     Args:
@@ -241,24 +241,46 @@ def _evaluate_prediction_target_pair(prediction, target, entity_ids,
 
     Returns:
         Dict of per-root-cause metrics.
+
+    Key semantics:
+        - component_rank: position of GT in full component_ranking (1..N).
+          Drives Top-1, Top-3, MRR, avg_rank.
+        - selected_component_hit: whether the model's chosen prediction
+          component matches GT. Drives Joint Hit.
+        - For unresolved GT (component_idx < 0): explicit miss in all
+          component/joint metrics regardless of entity count.
     """
     gt_c = target.get("component_idx", -1)
     gt_ts = target.get("timestamp", 0.0)
     tolerance = target.get("tolerance", 1)
+    gt_unresolved = (gt_c < 0 and need_component)
 
-    comp_hit = False
-    comp_rank = len(entity_ids) if need_component else 1
+    component_rank = len(entity_ids)
+    selected_component_hit = False
 
-    if need_component and component_ranking is not None:
+    if gt_unresolved:
+        component_rank = len(entity_ids)
+        selected_component_hit = False
+    elif need_component and component_ranking is not None:
+        found_in_ranking = False
         for rank, (cname, _cscore) in enumerate(component_ranking):
             cidx = _resolve_component_idx(cname, entity_ids)
-            if cidx == gt_c and gt_c >= 0:
-                comp_rank = rank + 1
-                comp_hit = True
+            if cidx == gt_c:
+                component_rank = rank + 1
+                found_in_ranking = True
                 break
-    elif need_component and gt_c >= 0:
-        comp_hit = prediction is not None and prediction.get("component_idx", -1) == gt_c
-        comp_rank = 1 if comp_hit else len(entity_ids)
+        if not found_in_ranking:
+            component_rank = len(entity_ids)
+        selected_component_hit = (
+            prediction is not None
+            and prediction.get("component_idx", -1) == gt_c
+        )
+    elif need_component:
+        selected_component_hit = (
+            prediction is not None
+            and prediction.get("component_idx", -1) == gt_c
+        )
+        component_rank = 1 if selected_component_hit else len(entity_ids)
 
     time_hit = False
     time_error_min = float('inf')
@@ -268,22 +290,38 @@ def _evaluate_prediction_target_pair(prediction, target, entity_ids,
             time_error_min = time_error_sec / 60.0
             time_hit = time_error_sec <= tolerance * 60
 
-    joint_hit = comp_hit and time_hit if (need_component and need_time) else (comp_hit or time_hit)
+    if need_component and need_time:
+        joint_hit = selected_component_hit and time_hit
+    elif need_component:
+        joint_hit = selected_component_hit
+    elif need_time:
+        joint_hit = time_hit
+    else:
+        joint_hit = False
+
+    if gt_unresolved:
+        top1 = False
+        top3 = False
+        rr = 0.0
+    else:
+        top1 = (component_rank == 1)
+        top3 = (component_rank <= 3)
+        rr = 1.0 / max(1, component_rank)
 
     return {
-        "component_rank": comp_rank,
-        "component_top1": comp_rank == 1,
-        "component_top3": comp_rank <= 3,
+        "component_rank": component_rank,
+        "component_top1": top1,
+        "component_top3": top3,
         "time_error": float('nan') if time_error_min == float('inf') else time_error_min,
         "time_error_min": time_error_min if time_error_min != float('inf') else float('nan'),
         "time_hit": time_hit,
         "time_hit_5min": bool(time_error_min <= 5.0),
         "time_hit_10min": bool(time_error_min <= 10.0),
         "time_hit_15min": bool(time_error_min <= 15.0),
-        "joint_component_hit": comp_hit,
+        "joint_component_hit": selected_component_hit,
         "joint_time_hit": time_hit,
         "joint_hit": joint_hit,
-        "reciprocal_rank": 1.0 / max(1, comp_rank),
+        "reciprocal_rank": rr,
         "component_applicable": need_component,
         "time_applicable": need_time,
         "joint_applicable": (need_component and need_time),

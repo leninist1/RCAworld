@@ -468,5 +468,59 @@ class PhaseAApplicabilityFilteringTest(unittest.TestCase):
         self.assertEqual(agg["resolved_component_top1"], 1.0)
 
 
+class PhaseAJointHitSemanticsTest(unittest.TestCase):
+    def test_wrong_selected_component_with_gt_in_top3_gives_joint_hit_false(self):
+        entity_ids = ["redis01", "mysql01", "nginx01"]
+        component_ranking = [
+            ("redis01", 0.95),
+            ("mysql01", 0.82),
+            ("nginx01", 0.41),
+        ]
+        target = {
+            "component": "mysql01",
+            "component_idx": 1,
+            "timestamp": _ts("2024-01-01 09:12:00"),
+            "tolerance": 5,
+        }
+        prediction = {
+            "component": "redis01",
+            "component_idx": 0,
+            "timestamp": _ts("2024-01-01 09:10:00"),
+        }
+
+        metrics = _evaluate_prediction_target_pair(
+            prediction, target, entity_ids,
+            component_ranking=component_ranking,
+            need_component=True, need_time=True,
+        )
+
+        self.assertFalse(metrics["component_top1"])
+        self.assertTrue(metrics["component_top3"])
+        self.assertAlmostEqual(metrics["reciprocal_rank"], 0.5, places=3)
+        self.assertEqual(metrics["component_rank"], 2)
+        self.assertFalse(metrics["joint_hit"])
+        self.assertFalse(metrics["joint_component_hit"])
+        self.assertTrue(metrics["joint_time_hit"])
+
+    def test_unresolved_gt_small_entity_set_no_false_top3_or_nonzero_mrr(self):
+        entity_ids = ["mysql01", "redis01"]
+        target = {
+            "component_idx": -1,
+            "timestamp": 0.0,
+            "tolerance": 1,
+        }
+
+        metrics = _evaluate_prediction_target_pair(
+            None, target, entity_ids,
+            component_ranking=None,
+            need_component=True, need_time=False,
+        )
+
+        self.assertFalse(metrics["component_top1"])
+        self.assertFalse(metrics["component_top3"])
+        self.assertAlmostEqual(metrics["reciprocal_rank"], 0.0, places=3)
+        self.assertFalse(metrics["joint_hit"])
+
+
 if __name__ == "__main__":
     unittest.main()
