@@ -1,13 +1,16 @@
-"""Phase 0.8 Round 4: Evaluation script — reads predictions.json + GT.
+"""Phase 0.8 Round 5: Evaluation script — separated counts, real ranking, query mask.
 
 This script reads:
   - predictions.json (from phaseA_run_inference.py)
   - query.csv scoring_points column (via load_eval_targets)
-  - record.csv (for label matching)
 
-It evaluates multi-fault queries with one-to-one prediction/target matching.
+Target construction is from scoring_points ONLY (not record.csv).
+record.csv is optional diagnostic only.
+Query mask (need_time / need_component / need_reason) controls output fields.
+Reason-requiring queries are unsupported and written to skipped_queries.csv.
 """
 
+import csv
 import json
 import os
 import sys
@@ -127,18 +130,20 @@ def _parse_prediction(prediction, entity_ids):
     }
 
 
-def _build_eval_targets(eval_target, entity_ids):
+def _build_eval_targets(eval_target, entity_ids, need_component=True, need_time=True):
     """Build official eval targets directly from EvalTarget.root_causes.
 
     Each root_cause is (component, datetime_str, reason, tolerance_min).
     Targets are constructed directly from scoring_points — record.csv labels
     are NOT used for component or timestamp decisions.
 
+    Respects query mask:
+    - need_component=False: component_idx set to -1 (any component ok).
+    - need_time=False: timestamp set to 0.0 (no time constraint).
+
     Returns:
-        targets: List of target dicts with component, component_idx, timestamp,
-                 reason, tolerance.
-        unresolved_targets: List of root_cause tuples that could not be resolved
-                            (unparseable datetime or unresolvable component).
+        targets: List of target dicts.
+        unresolved_targets: List of root_cause tuples that could not be resolved.
     """
     targets = []
     unresolved_targets = []
@@ -152,13 +157,19 @@ def _build_eval_targets(eval_target, entity_ids):
             except (ValueError, OSError):
                 pass
 
-        comp_idx = _resolve_component_idx(comp, entity_ids)
+        comp_idx = _resolve_component_idx(comp, entity_ids) if need_component else -1
 
-        if parsed_ts is not None and comp_idx >= 0:
+        is_valid = True
+        if need_component and comp_idx < 0:
+            is_valid = False
+        if need_time and parsed_ts is None:
+            is_valid = False
+
+        if is_valid:
             targets.append({
-                "component": comp,
-                "component_idx": comp_idx,
-                "timestamp": parsed_ts,
+                "component": comp if comp else "",
+                "component_idx": comp_idx if need_component else -1,
+                "timestamp": parsed_ts if parsed_ts is not None else 0.0,
                 "reason": reason,
                 "tolerance": tolerance,
                 "target_component": comp,
@@ -173,15 +184,19 @@ def _build_eval_targets(eval_target, entity_ids):
 
 def _matching_cost(prediction, target, component_mismatch_penalty=10000.0):
     cost = 0.0
-    if prediction.get("component_idx", -1) != target.get("component_idx", -1):
+    target_cidx = target.get("component_idx", -1)
+    pred_cidx = prediction.get("component_idx", -1)
+
+    if target_cidx >= 0 and pred_cidx != target_cidx:
         cost += component_mismatch_penalty
 
     pred_ts = prediction.get("timestamp")
     target_ts = target.get("timestamp")
-    if pred_ts is None or target_ts is None:
-        cost += component_mismatch_penalty
-    else:
-        cost += abs(pred_ts - target_ts) / 60.0
+    if target_ts is not None and target_ts > 0:
+        if pred_ts is None:
+            cost += component_mismatch_penalty
+        else:
+            cost += abs(pred_ts - target_ts) / 60.0
     return cost
 
 
@@ -213,22 +228,49 @@ def match_predictions_to_targets(predictions, targets):
     return matched_pairs, unmatched_predictions, unmatched_targets
 
 
-def _evaluate_prediction_target_pair(prediction, target, entity_ids):
-    gt_c = target["component_idx"]
-    gt_ts = target["timestamp"]
-    tolerance = target["tolerance"]
+def _evaluate_prediction_target_pair(prediction, target, entity_ids,
+                                       component_ranking=None,
+                                       need_component=True, need_time=True):
+    """Evaluate one prediction-target pair with real component ranking.
 
-    comp_hit = prediction is not None and prediction.get("component_idx", -1) == gt_c
+    Args:
+        prediction: Parsed prediction dict or None (for unmatched targets).
+        target: GT target dict.
+        entity_ids: List of entity ID strings.
+        component_ranking: List of (component_name, score) sorted desc, or None.
+        need_component: Whether component is evaluated (from query mask).
+        need_time: Whether time is evaluated (from query mask).
+
+    Returns:
+        Dict of per-root-cause metrics.
+    """
+    gt_c = target.get("component_idx", -1)
+    gt_ts = target.get("timestamp", 0.0)
+    tolerance = target.get("tolerance", 1)
+
+    comp_hit = False
+    comp_rank = len(entity_ids) if need_component else 1
+
+    if need_component and component_ranking is not None:
+        for rank, (cname, _cscore) in enumerate(component_ranking):
+            cidx = _resolve_component_idx(cname, entity_ids)
+            if cidx == gt_c and gt_c >= 0:
+                comp_rank = rank + 1
+                comp_hit = True
+                break
+    elif need_component and gt_c >= 0:
+        comp_hit = prediction is not None and prediction.get("component_idx", -1) == gt_c
+        comp_rank = 1 if comp_hit else len(entity_ids)
 
     time_hit = False
     time_error_min = float('inf')
-    if prediction is not None and prediction.get("timestamp") is not None:
-        time_error_sec = abs(prediction["timestamp"] - gt_ts)
-        time_error_min = time_error_sec / 60.0
-        time_hit = time_error_sec <= tolerance * 60
+    if need_time and gt_ts > 0:
+        if prediction is not None and prediction.get("timestamp") is not None:
+            time_error_sec = abs(prediction["timestamp"] - gt_ts)
+            time_error_min = time_error_sec / 60.0
+            time_hit = time_error_sec <= tolerance * 60
 
-    comp_rank = 1 if comp_hit else len(entity_ids)
-    joint_hit = comp_hit and time_hit
+    joint_hit = comp_hit and time_hit if (need_component and need_time) else (comp_hit or time_hit)
 
     return {
         "component_rank": comp_rank,
@@ -248,17 +290,22 @@ def _evaluate_prediction_target_pair(prediction, target, entity_ids):
 
 
 def evaluate_system(sys_name, predictions_by_id, resample_sec):
-    """Evaluate predictions for one system with one-to-one prediction matching."""
+    """Evaluate predictions for one system with separated counts and query mask.
+
+    Returns:
+        agg: Aggregated metrics dict.
+        skipped_queries: List of skipped query records for skipped_queries.csv.
+    """
     cfg = SYSTEM_CONFIGS[sys_name]
     data_dir = cfg["data_dir"]
     if not os.path.exists(data_dir):
         print(f"  Data directory not found: {data_dir}")
-        return {"n": 0}
+        return {"n": 0}, []
 
     query_path = os.path.join(data_dir, "query.csv")
     if not os.path.exists(query_path):
         print(f"  query.csv not found: {query_path}")
-        return {"n": 0}
+        return {"n": 0}, []
 
     eval_targets = load_eval_targets(query_path)
     print(f"  Loaded {len(eval_targets)} eval targets from query.csv scoring_points")
@@ -272,57 +319,180 @@ def evaluate_system(sys_name, predictions_by_id, resample_sec):
     entity_ids = [e.entity_id for e in cont_entities]
     print(f"  Entities: {len(entity_ids)}")
 
-    labels = _extract_labels(data_dir, entity_ids, adapter)
-    print(f"  Loaded {len(labels)} labels from record.csv (diagnostic only)")
+    record_csv_path = os.path.join(data_dir, "record.csv")
+    if os.path.exists(record_csv_path):
+        labels = _extract_labels(data_dir, entity_ids, adapter)
+        print(f"  Loaded {len(labels)} labels from record.csv (diagnostic only)")
+    else:
+        labels = []
+        print("  record.csv not found — evaluation continues without diagnostic labels")
+
+    official_query_count = len(eval_targets)
+    parsed_query_count = 0
+    evaluated_query_count = 0
+    skipped_query_count = 0
+    total_official_rc = 0
+    total_resolved_rc = 0
+    total_unresolved_rc = 0
+    total_predicted_rc = 0
+    total_matched_rc = 0
+    total_unmatched_rc = 0
 
     query_results = []
-    processed = 0
-    skipped_no_target = 0
-    total_unresolved = 0
+    skipped_queries = []
 
     for qid, eval_tgt in eval_targets.items():
-        pred_entry = predictions_by_id.get(qid, {"query_id": qid, "predictions": []})
-        raw_predictions = pred_entry.get("predictions", [])
+        official_rc_count = len(eval_tgt.root_causes)
+        total_official_rc += official_rc_count
+        parsed_query_count += 1
 
-        targets, unresolved = _build_eval_targets(eval_tgt, entity_ids)
-        total_unresolved += len(unresolved)
-        if not targets:
-            skipped_no_target += 1
+        need_component = eval_tgt.need_component
+        need_time = eval_tgt.need_time
+        need_reason = eval_tgt.need_reason
+
+        if need_reason:
+            skipped_query_count += 1
+            skipped_queries.append({
+                "query_id": int(qid),
+                "reason": "unsupported",
+                "details": "reason inference not yet supported",
+            })
             continue
 
-        predictions = [_parse_prediction(prediction, entity_ids) for prediction in raw_predictions]
-        matched_pairs, _, unmatched_targets = match_predictions_to_targets(predictions, targets)
+        target_component_count = 0
+        target_time_count = 0
+        for rc in eval_tgt.root_causes:
+            _, dt_str, _, _ = rc
+            if dt_str:
+                target_time_count += 1
+            target_component_count += 1
 
-        num_faults_in_query = len(targets)
+        pred_entry = predictions_by_id.get(qid, {"query_id": qid, "predictions": []})
+        raw_predictions = pred_entry.get("predictions", [])
+        component_ranking = pred_entry.get("component_ranking")
+
+        targets, unresolved = _build_eval_targets(eval_tgt, entity_ids,
+                                                   need_component=need_component,
+                                                   need_time=need_time)
+        total_resolved_rc += len(targets)
+        total_unresolved_rc += len(unresolved)
+
+        resolved_count = len(targets)
+        unresolved_count = len(unresolved)
+
+        num_faults_in_query = resolved_count + unresolved_count
+
+        if not targets and not unresolved:
+            continue
+
+        predictions = [_parse_prediction(prediction, entity_ids)
+                       for prediction in raw_predictions]
+        total_predicted_rc += len(predictions)
+
+        if not targets:
+            skipped_query_count += 1
+            skipped_queries.append({
+                "query_id": int(qid),
+                "reason": "no_resolved_targets",
+                "details": f"all {len(unresolved)} root cause(s) unresolved",
+            })
+            for _ in range(unresolved_count):
+                metrics = _evaluate_prediction_target_pair(
+                    None, {"component_idx": -1, "timestamp": 0.0, "tolerance": 1},
+                    entity_ids, component_ranking=None,
+                    need_component=need_component, need_time=need_time,
+                )
+                metrics["num_faults_in_query"] = num_faults_in_query
+                metrics["unresolved"] = True
+                query_results.append(metrics)
+            total_unresolved_rc += unresolved_count
+            continue
+
+        matched_pairs, unmatched_predictions, unmatched_targets = \
+            match_predictions_to_targets(predictions, targets)
+
+        total_matched_rc += len(matched_pairs)
+        total_unmatched_rc += len(unmatched_targets)
+
         for pair in matched_pairs:
-            metrics = _evaluate_prediction_target_pair(pair["prediction"], pair["target"], entity_ids)
+            metrics = _evaluate_prediction_target_pair(
+                pair["prediction"], pair["target"], entity_ids,
+                component_ranking=component_ranking,
+                need_component=need_component, need_time=need_time,
+            )
             metrics["num_faults_in_query"] = num_faults_in_query
             metrics["query_window_coverage"] = 1.0
+            metrics["unresolved"] = False
             query_results.append(metrics)
 
         for target in unmatched_targets:
-            metrics = _evaluate_prediction_target_pair(None, target, entity_ids)
+            metrics = _evaluate_prediction_target_pair(
+                None, target, entity_ids,
+                component_ranking=component_ranking,
+                need_component=need_component, need_time=need_time,
+            )
             metrics["num_faults_in_query"] = num_faults_in_query
             metrics["query_window_coverage"] = 1.0
+            metrics["unresolved"] = False
             query_results.append(metrics)
 
-        processed += 1
+        for _ in range(unresolved_count):
+            metrics = _evaluate_prediction_target_pair(
+                None, {"component_idx": -1, "timestamp": 0.0, "tolerance": 1},
+                entity_ids, component_ranking=None,
+                need_component=need_component, need_time=need_time,
+            )
+            metrics["num_faults_in_query"] = num_faults_in_query
+            metrics["unresolved"] = True
+            query_results.append(metrics)
 
-    num_root_causes = len(query_results)
-    skipped = skipped_no_target
-    print(f"  Evaluated queries: {processed} | "
-          f"Total root-causes: {num_root_causes} | "
-          f"Skipped: {skipped} (no_target: {skipped_no_target}) | "
-          f"Unresolved: {total_unresolved}")
+        evaluated_query_count += 1
 
-    agg = aggregate_metrics(query_results)
-    agg["total_official"] = len(eval_targets)
-    agg["n_queries_evaluated"] = processed
-    agg["n_queries_skipped"] = skipped
-    agg["n_queries_skipped_no_pred"] = 0
-    agg["n_queries_skipped_no_target"] = skipped_no_target
-    agg["n_unresolved_rc"] = total_unresolved
-    return agg
+    num_root_causes = total_matched_rc + total_unmatched_rc + total_unresolved_rc
+    print(f"  official_queries: {official_query_count} | "
+          f"parsed: {parsed_query_count} | "
+          f"evaluated: {evaluated_query_count} | "
+          f"skipped: {skipped_query_count}")
+    print(f"  official_rc: {total_official_rc} | "
+          f"resolved: {total_resolved_rc} | "
+          f"unresolved: {total_unresolved_rc} | "
+          f"predicted: {total_predicted_rc} | "
+          f"matched: {total_matched_rc} | "
+          f"unmatched: {total_unmatched_rc}")
+
+    resolved_results = [r for r in query_results if not r.get("unresolved", False)]
+    agg_all = aggregate_metrics(query_results)
+    agg_resolved = aggregate_metrics(resolved_results) if resolved_results else {"n": 0}
+
+    agg = {
+        "official_query_count": official_query_count,
+        "parsed_query_count": parsed_query_count,
+        "evaluated_query_count": evaluated_query_count,
+        "skipped_query_count": skipped_query_count,
+        "official_root_cause_count": total_official_rc,
+        "resolved_root_cause_count": total_resolved_rc,
+        "unresolved_root_cause_count": total_unresolved_rc,
+        "predicted_root_cause_count": total_predicted_rc,
+        "matched_root_cause_count": total_matched_rc,
+        "unmatched_root_cause_count": total_unmatched_rc,
+        "n": len(query_results),
+        "n_resolved": len(resolved_results),
+        "component_top1": agg_all.get("component_top1", 0),
+        "component_top3": agg_all.get("component_top3", 0),
+        "mrr": agg_all.get("mrr", 0),
+        "avg_rank": agg_all.get("avg_rank", 0),
+        "time_hit_rate": agg_all.get("time_hit_rate", 0),
+        "time_mae": agg_all.get("time_mae", 0),
+        "time_mae_min": agg_all.get("time_mae_min", 0),
+        "time_hit_5min": agg_all.get("time_hit_5min", 0),
+        "time_hit_10min": agg_all.get("time_hit_10min", 0),
+        "time_hit_15min": agg_all.get("time_hit_15min", 0),
+        "joint_hit_rate": agg_all.get("joint_hit_rate", 0),
+        "resolved_component_top1": agg_resolved.get("component_top1", 0),
+        "resolved_component_top3": agg_resolved.get("component_top3", 0),
+        "resolved_mrr": agg_resolved.get("mrr", 0),
+    }
+    return agg, skipped_queries
 
 
 def main():
@@ -331,6 +501,7 @@ def main():
     parser.add_argument('--systems', nargs='+',
                         default=['Bank', 'Market/cloudbed-1', 'Market/cloudbed-2', 'Telecom'])
     parser.add_argument('--resample_sec', type=int, default=120)
+    parser.add_argument('--skipped_csv', type=str, default='skipped_queries.csv')
     args = parser.parse_args()
 
     if not os.path.exists(args.predictions):
@@ -345,25 +516,38 @@ def main():
     print(f"Loaded {len(predictions_by_id)} prediction entries from {args.predictions}")
 
     print("=" * 60)
-    print("Phase 0.8 R4: Evaluation (one-to-one matching over predictions.json + GT)")
+    print("Phase 0.8 R5: Evaluation (real ranking, query mask, separated counts)")
     print("=" * 60)
 
     all_results = {}
+    all_skipped = []
     for sys_name in args.systems:
         print(f"\n{'='*60}")
         print(f"  {sys_name}")
         print(f"{'='*60}")
-        agg = evaluate_system(sys_name, predictions_by_id, args.resample_sec)
+        agg, skipped_queries = evaluate_system(sys_name, predictions_by_id, args.resample_sec)
         all_results[sys_name] = agg
+        for sq in skipped_queries:
+            sq["system"] = sys_name
+        all_skipped.extend(skipped_queries)
 
-    print(f"\n{'='*100}")
+    if all_skipped:
+        with open(args.skipped_csv, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=["query_id", "system", "reason", "details"])
+            writer.writeheader()
+            writer.writerows(all_skipped)
+        print(f"\nSkipped queries written to {args.skipped_csv}: {len(all_skipped)} rows")
+
+    print(f"\n{'='*115}")
     print(f"RESULTS")
-    print(f"{'='*100}")
+    print(f"{'='*115}")
     header = (f"{'System':<18s} {'T1':>6s} {'T3':>6s} {'MRR':>7s} "
               f"{'H@5m':>6s} {'H@10m':>6s} {'H@15m':>6s} "
-              f"{'MAEmin':>7s} {'Jnt':>5s} {'#root':>6s} {'#q':>5s}")
+              f"{'MAEmin':>7s} {'Jnt':>5s} "
+              f"{'#oQ':>5s} {'#eQ':>5s} {'#sQ':>5s} "
+              f"{'#oRC':>5s} {'#rRC':>5s} {'#uRC':>5s}")
     print(header)
-    print("-" * 100)
+    print("-" * 115)
     for sys_name in args.systems:
         if sys_name not in all_results:
             continue
@@ -371,26 +555,31 @@ def main():
         if r.get("n", 0) == 0:
             print(f"{sys_name:<18s} {'--':>6s} {'--':>6s} {'--':>7s} "
                   f"{'--':>6s} {'--':>6s} {'--':>6s} {'--':>7s} {'--':>5s} "
-                  f"{'0':>6s} {'0':>5s}")
+                  f"{'0':>5s} {'0':>5s} {'0':>5s} {'0':>5s} {'0':>5s} {'0':>5s}")
             continue
-        time_mae_min = r.get('time_mae_min', r.get('time_mae', 0) * args.resample_sec / 60.0)
+        time_mae_min = r.get('time_mae_min', 0)
         if isinstance(time_mae_min, (np.ndarray,)):
             time_mae_min = float(time_mae_min)
-        total_q = r.get('total_official', 0)
-        n_q_eval = r.get('n_queries_evaluated', r.get('n', 0))
+        if isinstance(time_mae_min, float) and np.isnan(time_mae_min):
+            time_mae_min = float('inf')
         print(f"{sys_name:<18s} "
               f"{r['component_top1']:>5.1%} {r['component_top3']:>5.1%} "
               f"{r['mrr']:>7.3f} "
               f"{r.get('time_hit_5min', 0):>5.1%} "
               f"{r.get('time_hit_10min', 0):>5.1%} "
               f"{r.get('time_hit_15min', 0):>5.1%} "
-              f"{time_mae_min:>7.1f} "
+              f"{time_mae_min if np.isfinite(time_mae_min) else 0.0:>7.1f} "
               f"{r['joint_hit_rate']:>4.1%} "
-              f"{r['n']:>6d} "
-              f"{total_q:>5d}")
-    print("-" * 100)
+              f"{r.get('official_query_count', 0):>5d} "
+              f"{r.get('evaluated_query_count', 0):>5d} "
+              f"{r.get('skipped_query_count', 0):>5d} "
+              f"{r.get('official_root_cause_count', 0):>5d} "
+              f"{r.get('resolved_root_cause_count', 0):>5d} "
+              f"{r.get('unresolved_root_cause_count', 0):>5d}")
+    print("-" * 115)
     print(f"Legend: T1=Top-1, T3=Top-3, H@5m=Hit@5min, Jnt=Joint Hit, "
-          f"#root=root-cause instances, #q=official queries")
+          f"#oQ=official queries, #eQ=evaluated, #sQ=skipped, "
+          f"#oRC=official root-causes, #rRC=resolved, #uRC=unresolved")
     print(f"\nDone.")
 
 

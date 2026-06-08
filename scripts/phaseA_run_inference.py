@@ -289,9 +289,16 @@ def run_inference(sys_name, model, state, ob_mean, ob_std, use_posterior,
                 "score": round(float(pscore), 6),
             })
 
+        comp_scores = joint.component_score  # [N]
+        component_ranking = sorted(
+            [(entity_ids[i], round(float(comp_scores[i]), 6)) for i in range(N)],
+            key=lambda x: x[1], reverse=True,
+        )
+
         all_predictions.append({
             "query_id": int(qid),
             "predictions": pred_list,
+            "component_ranking": component_ranking,
         })
         processed += 1
 
