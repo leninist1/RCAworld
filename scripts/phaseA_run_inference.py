@@ -296,6 +296,7 @@ def run_inference(sys_name, model, state, ob_mean, ob_std, use_posterior,
         )
 
         all_predictions.append({
+            "system": sys_name,
             "query_id": int(qid),
             "predictions": pred_list,
             "component_ranking": component_ranking,

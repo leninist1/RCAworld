@@ -289,7 +289,7 @@ def _evaluate_prediction_target_pair(prediction, target, entity_ids,
     }
 
 
-def evaluate_system(sys_name, predictions_by_id, resample_sec):
+def evaluate_system(sys_name, predictions_by_key, resample_sec):
     """Evaluate predictions for one system with separated counts and query mask.
 
     Returns:
@@ -367,7 +367,8 @@ def evaluate_system(sys_name, predictions_by_id, resample_sec):
                 target_time_count += 1
             target_component_count += 1
 
-        pred_entry = predictions_by_id.get(qid, {"query_id": qid, "predictions": []})
+        pred_entry = predictions_by_key.get((sys_name, qid),
+                                           {"query_id": qid, "predictions": []})
         raw_predictions = pred_entry.get("predictions", [])
         component_ranking = pred_entry.get("component_ranking")
 
@@ -512,8 +513,14 @@ def main():
     with open(args.predictions, 'r') as f:
         all_predictions = json.load(f)
 
-    predictions_by_id = {p["query_id"]: p for p in all_predictions}
-    print(f"Loaded {len(predictions_by_id)} prediction entries from {args.predictions}")
+    missing_system = [p for p in all_predictions if "system" not in p]
+    if missing_system:
+        print(f"ERROR: {len(missing_system)} prediction entries missing 'system' field. "
+              f"Re-run phaseA_run_inference.py to regenerate predictions.json.")
+        return
+
+    predictions_by_key = {(p["system"], p["query_id"]): p for p in all_predictions}
+    print(f"Loaded {len(predictions_by_key)} prediction entries from {args.predictions}")
 
     print("=" * 60)
     print("Phase 0.8 R5: Evaluation (real ranking, query mask, separated counts)")
@@ -525,7 +532,7 @@ def main():
         print(f"\n{'='*60}")
         print(f"  {sys_name}")
         print(f"{'='*60}")
-        agg, skipped_queries = evaluate_system(sys_name, predictions_by_id, args.resample_sec)
+        agg, skipped_queries = evaluate_system(sys_name, predictions_by_key, args.resample_sec)
         all_results[sys_name] = agg
         for sq in skipped_queries:
             sq["system"] = sys_name

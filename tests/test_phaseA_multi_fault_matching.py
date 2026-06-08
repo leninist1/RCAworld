@@ -310,5 +310,57 @@ class PhaseARealRankingTest(unittest.TestCase):
         self.assertFalse(eval_target.need_time)
 
 
+class CrossSystemQueryIdIsolationTest(unittest.TestCase):
+    def test_same_query_id_across_systems_does_not_overwrite(self):
+        bank_entry = {
+            "system": "Bank",
+            "query_id": 0,
+            "predictions": [
+                {"datetime": "2024-01-01 09:12:00", "component": "mysql01",
+                 "score": 0.95},
+            ],
+            "component_ranking": [("mysql01", 0.95), ("redis01", 0.42)],
+        }
+        telecom_entry = {
+            "system": "Telecom",
+            "query_id": 0,
+            "predictions": [
+                {"datetime": "2024-01-01 10:05:00", "component": "router01",
+                 "score": 0.88},
+            ],
+            "component_ranking": [("router01", 0.88), ("switch01", 0.31)],
+        }
+
+        all_predictions = [bank_entry, telecom_entry]
+        predictions_by_key = {(p["system"], p["query_id"]): p
+                              for p in all_predictions}
+
+        self.assertEqual(len(predictions_by_key), 2)
+
+        bank_key = ("Bank", 0)
+        telecom_key = ("Telecom", 0)
+        self.assertIn(bank_key, predictions_by_key)
+        self.assertIn(telecom_key, predictions_by_key)
+
+        bank_pred = predictions_by_key.get(bank_key,
+                                            {"query_id": 0, "predictions": []})
+        telecom_pred = predictions_by_key.get(telecom_key,
+                                               {"query_id": 0, "predictions": []})
+
+        self.assertEqual(bank_pred["predictions"][0]["component"], "mysql01")
+        self.assertEqual(telecom_pred["predictions"][0]["component"], "router01")
+
+    def test_old_predictions_without_system_field_are_detected(self):
+        old_entry = {
+            "query_id": 0,
+            "predictions": [
+                {"datetime": "2024-01-01 09:12:00", "component": "mysql01",
+                 "score": 0.95},
+            ],
+        }
+        missing_system = [p for p in [old_entry] if "system" not in p]
+        self.assertEqual(len(missing_system), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
