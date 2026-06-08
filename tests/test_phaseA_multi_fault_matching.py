@@ -522,5 +522,120 @@ class PhaseAJointHitSemanticsTest(unittest.TestCase):
         self.assertFalse(metrics["joint_hit"])
 
 
+class PhaseAQueryMaskSerializationTest(unittest.TestCase):
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.tmpdir = Path(self._tmpdir.name)
+
+    def tearDown(self):
+        self._tmpdir.cleanup()
+
+    def _write_query_csv(self, task, instruction):
+        query_csv = self.tmpdir / "query.csv"
+        with query_csv.open("w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=["task_index", "instruction"])
+            writer.writeheader()
+            writer.writerow({"task_index": task, "instruction": instruction})
+        return str(query_csv)
+
+    def test_component_only_query_prediction_has_component_not_datetime(self):
+        instruction = (
+            "On January 1, 2024, from 09:00 to 10:00, a single failure was detected. "
+            "Please identify the component."
+        )
+        query_csv_path = self._write_query_csv("task_3", instruction)
+        queries = parse_inference_queries(query_csv_path)
+        iq = queries[0]
+
+        self.assertTrue(iq.need_component)
+        self.assertFalse(iq.need_time)
+        self.assertFalse(iq.need_reason)
+
+        item = {"score": 0.95}
+        if iq.need_time:
+            item["datetime"] = "2024-01-01 09:12:00"
+        if iq.need_component:
+            item["component"] = "mysql01"
+
+        self.assertIn("component", item)
+        self.assertNotIn("datetime", item)
+        self.assertNotIn("reason", item)
+
+    def test_time_only_query_prediction_has_datetime_not_component(self):
+        instruction = (
+            "On January 1, 2024, from 09:00 to 10:00, a single failure was detected. "
+            "Please identify the occurrence time."
+        )
+        query_csv_path = self._write_query_csv("task_1", instruction)
+        queries = parse_inference_queries(query_csv_path)
+        iq = queries[0]
+
+        self.assertTrue(iq.need_time)
+        self.assertFalse(iq.need_component)
+        self.assertFalse(iq.need_reason)
+
+        item = {"score": 0.95}
+        if iq.need_time:
+            item["datetime"] = "2024-01-01 09:12:00"
+        if iq.need_component:
+            item["component"] = "mysql01"
+
+        self.assertIn("datetime", item)
+        self.assertNotIn("component", item)
+        self.assertNotIn("reason", item)
+
+    def test_time_component_query_prediction_has_both_not_reason(self):
+        instruction = (
+            "On January 1, 2024, from 09:00 to 10:00, a single failure was detected. "
+            "Please identify the occurrence time and component."
+        )
+        query_csv_path = self._write_query_csv("task_5", instruction)
+        queries = parse_inference_queries(query_csv_path)
+        iq = queries[0]
+
+        self.assertTrue(iq.need_time)
+        self.assertTrue(iq.need_component)
+        self.assertFalse(iq.need_reason)
+
+        item = {"score": 0.95}
+        if iq.need_time:
+            item["datetime"] = "2024-01-01 09:12:00"
+        if iq.need_component:
+            item["component"] = "mysql01"
+
+        self.assertIn("datetime", item)
+        self.assertIn("component", item)
+        self.assertNotIn("reason", item)
+
+    def test_query_level_result_contains_need_flags(self):
+        instruction = (
+            "On January 1, 2024, from 09:00 to 10:00, a single failure was detected. "
+            "Please identify the occurrence time, component, and reason."
+        )
+        query_csv_path = self._write_query_csv("task_7", instruction)
+        queries = parse_inference_queries(query_csv_path)
+        iq = queries[0]
+
+        self.assertTrue(iq.need_time)
+        self.assertTrue(iq.need_component)
+        self.assertTrue(iq.need_reason)
+
+        entry = {
+            "system": "Bank",
+            "query_id": int(iq.query_id),
+            "predictions": [],
+            "component_ranking": [],
+            "need_time": iq.need_time,
+            "need_component": iq.need_component,
+            "need_reason": iq.need_reason,
+        }
+
+        self.assertTrue(entry["need_time"])
+        self.assertTrue(entry["need_component"])
+        self.assertTrue(entry["need_reason"])
+        self.assertNotIn("reason", entry.get("predictions", [{}])[0]
+                         if entry.get("predictions") else {})
+
+
 if __name__ == "__main__":
     unittest.main()

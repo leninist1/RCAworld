@@ -283,11 +283,12 @@ def run_inference(sys_name, model, state, ob_mean, ob_std, use_posterior,
         for pt, pc, pscore in predictions:
             dt = datetime.fromtimestamp(ts_sub[pt], tz=OPENRCA_TZ).strftime("%Y-%m-%d %H:%M:%S")
             comp_name = entity_ids[pc] if pc < len(entity_ids) else f"entity_{pc}"
-            pred_list.append({
-                "datetime": dt,
-                "component": comp_name,
-                "score": round(float(pscore), 6),
-            })
+            item = {"score": round(float(pscore), 6)}
+            if iq.need_time:
+                item["datetime"] = dt
+            if iq.need_component:
+                item["component"] = comp_name
+            pred_list.append(item)
 
         comp_scores = joint.component_score  # [N]
         component_ranking = sorted(
@@ -300,6 +301,9 @@ def run_inference(sys_name, model, state, ob_mean, ob_std, use_posterior,
             "query_id": int(qid),
             "predictions": pred_list,
             "component_ranking": component_ranking,
+            "need_time": iq.need_time,
+            "need_component": iq.need_component,
+            "need_reason": iq.need_reason,
         })
         processed += 1
 
