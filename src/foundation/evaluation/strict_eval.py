@@ -362,7 +362,7 @@ def compute_joint_scores(
     lambda_residual: float = 1.0,
     lambda_shift: float = 0.5,
     lambda_early: float = 0.3,
-    lambda_onset: float = 1.0,
+    lambda_onset: float = 0.0,
     temporal_smooth_window: int = 3,
 ) -> JointScores:
     """Compute joint S[t,c] score matrix WITHOUT reading GT.

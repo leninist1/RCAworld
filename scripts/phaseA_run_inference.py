@@ -89,7 +89,8 @@ def _make_adapter(adapter_cls_name, include_dates):
 
 
 def compute_residuals_and_latents(model, params, tensor_norm, type_idx,
-                                  obs_mask, use_posterior=False, ws=WS):
+                                   obs_mask, use_posterior=False, ws=WS,
+                                   require_onset_scores=False):
     """Sliding-window inference with tail coverage (P1.4)."""
     T, N, D = tensor_norm.shape
     resid_acc = np.zeros((T, N), dtype=np.float32)
@@ -129,8 +130,21 @@ def compute_residuals_and_latents(model, params, tensor_norm, type_idx,
             obs_mask=o_mask_j, use_posterior=use_posterior)
         res_b = np.array(out["residual"])
         h_b = np.array(out["h_seq"])
-        onset_b = np.array(out.get("onset", {}).get("onset_score",
-                   np.zeros_like(res_b)))
+
+        if require_onset_scores:
+            if "onset" not in out or "onset_score" not in out.get("onset", {}):
+                raise ValueError(
+                    "require_onset_scores=True but model output missing "
+                    "onset.onset_score")
+            onset_raw = np.array(out["onset"]["onset_score"])
+            if onset_raw.shape != res_b.shape:
+                raise ValueError(
+                    f"onset_score shape {onset_raw.shape} does not match "
+                    f"residual shape {res_b.shape}")
+            onset_b = onset_raw
+        else:
+            onset_b = np.array(out.get("onset", {}).get("onset_score",
+                               np.zeros_like(res_b)))
 
         for j, (s, e) in enumerate(pos[i:i + 8]):
             ns = min(res_b.shape[1], e - s)
@@ -213,6 +227,12 @@ def run_inference(sys_name, model, state, ob_mean, ob_std, use_posterior,
                    scoring_method, all_zero_type, burn_in_min, resample_sec,
                    lambda_onset=0.0):
     """Run inference for one system — ZERO GT access."""
+    if scoring_method == "onset_head" and lambda_onset <= 0:
+        raise ValueError(
+            "scoring_method='onset_head' requires --lambda-onset > 0. "
+            f"Got lambda_onset={lambda_onset}")
+
+    require_onset = (lambda_onset > 0) or (scoring_method == "onset_head")
     cfg = SYSTEM_CONFIGS[sys_name]
     data_dir = cfg["data_dir"]
     if not os.path.exists(data_dir):
@@ -309,7 +329,8 @@ def run_inference(sys_name, model, state, ob_mean, ob_std, use_posterior,
 
         residuals, h_states, onset_scores, coverage_mask = compute_residuals_and_latents(
             model, state.params, tensor_sub, type_indices,
-            obs_mask_sub_2d, use_posterior=use_posterior, ws=WS)
+            obs_mask_sub_2d, use_posterior=use_posterior, ws=WS,
+            require_onset_scores=require_onset)
 
         if residuals.shape[0] == 0:
             continue
