@@ -1,8 +1,10 @@
 import csv
 import json
+import os
 import sys
 import tempfile
 import unittest
+from collections import OrderedDict
 from pathlib import Path
 
 import numpy as np
@@ -23,7 +25,8 @@ from phaseA_run_inference import (
     serialize_prediction_item, build_prediction_entry,
 )
 from phaseA_export_openrca_csv import (
-    build_export_rows, export_prediction_csv, ExportError, _validate_entry,
+    build_prediction_payload, build_export_row, export_prediction_csv,
+    ExportError, _validate_entry,
 )
 
 
@@ -641,7 +644,14 @@ class PhaseAQueryMaskSerializationTest(unittest.TestCase):
 
 
 class PhaseAOpenRCAExportTest(unittest.TestCase):
-    def test_component_only_query_exports_component_not_time_or_reason(self):
+    """Tests for OpenRCA-format prediction.csv export.
+
+    Each query is one CSV row with `row_id` and `prediction` columns.
+    The `prediction` cell is a JSON string with numbered root causes:
+        {"1": {"root cause component": "..."}, "2": {...}}
+    """
+
+    def test_component_only_query_row_has_component_in_prediction_json(self):
         entry = {
             "system": "Bank",
             "query_id": 0,
@@ -652,14 +662,13 @@ class PhaseAOpenRCAExportTest(unittest.TestCase):
                 {"score": 0.95, "component": "mysql01"},
             ],
         }
-        rows = build_export_rows(entry)
-        self.assertEqual(len(rows), 1)
-        row = rows[0]
-        self.assertEqual(row["query_id"], 0)
-        self.assertEqual(row["component"], "mysql01")
-        self.assertNotIn("occurrence_time", row)
+        payload = build_prediction_payload(entry)
+        self.assertEqual(len(payload), 1)
+        self.assertIn("1", payload)
+        self.assertEqual(payload["1"]["root cause component"], "mysql01")
+        self.assertNotIn("root cause occurrence datetime", payload["1"])
 
-    def test_time_only_query_exports_time_not_component_or_reason(self):
+    def test_time_only_query_row_has_datetime_in_prediction_json(self):
         entry = {
             "system": "Telecom",
             "query_id": 1,
@@ -670,14 +679,14 @@ class PhaseAOpenRCAExportTest(unittest.TestCase):
                 {"score": 0.88, "datetime": "2024-01-01 09:12:00"},
             ],
         }
-        rows = build_export_rows(entry)
-        self.assertEqual(len(rows), 1)
-        row = rows[0]
-        self.assertEqual(row["query_id"], 1)
-        self.assertEqual(row["occurrence_time"], "2024-01-01 09:12:00")
-        self.assertNotIn("component", row)
+        payload = build_prediction_payload(entry)
+        self.assertEqual(len(payload), 1)
+        self.assertEqual(
+            payload["1"]["root cause occurrence datetime"],
+            "2024-01-01 09:12:00")
+        self.assertNotIn("root cause component", payload["1"])
 
-    def test_time_component_query_exports_both(self):
+    def test_time_component_query_has_both_fields(self):
         entry = {
             "system": "Bank",
             "query_id": 2,
@@ -689,13 +698,14 @@ class PhaseAOpenRCAExportTest(unittest.TestCase):
                  "component": "mysql01"},
             ],
         }
-        rows = build_export_rows(entry)
-        self.assertEqual(len(rows), 1)
-        row = rows[0]
-        self.assertEqual(row["occurrence_time"], "2024-01-01 09:12:00")
-        self.assertEqual(row["component"], "mysql01")
+        payload = build_prediction_payload(entry)
+        self.assertEqual(
+            payload["1"]["root cause occurrence datetime"],
+            "2024-01-01 09:12:00")
+        self.assertEqual(
+            payload["1"]["root cause component"], "mysql01")
 
-    def test_multifault_time_component_sorted_by_datetime_ascending(self):
+    def test_multifault_time_component_single_row_sorted_by_datetime(self):
         entry = {
             "system": "Bank",
             "query_id": 3,
@@ -709,14 +719,22 @@ class PhaseAOpenRCAExportTest(unittest.TestCase):
                  "component": "mysql01"},
             ],
         }
-        rows = build_export_rows(entry)
-        self.assertEqual(len(rows), 2)
-        self.assertEqual(rows[0]["component"], "mysql01")
-        self.assertEqual(rows[0]["occurrence_time"], "2024-01-01 09:12:00")
-        self.assertEqual(rows[1]["component"], "redis01")
-        self.assertEqual(rows[1]["occurrence_time"], "2024-01-01 09:40:00")
+        payload = build_prediction_payload(entry)
+        self.assertEqual(len(payload), 2)
+        self.assertIn("1", payload)
+        self.assertIn("2", payload)
+        self.assertEqual(
+            payload["1"]["root cause component"], "mysql01")
+        self.assertEqual(
+            payload["1"]["root cause occurrence datetime"],
+            "2024-01-01 09:12:00")
+        self.assertEqual(
+            payload["2"]["root cause component"], "redis01")
+        self.assertEqual(
+            payload["2"]["root cause occurrence datetime"],
+            "2024-01-01 09:40:00")
 
-    def test_reason_only_query_rejected_as_unsupported(self):
+    def test_reason_only_query_raises_export_error_not_silent_skip(self):
         entry = {
             "system": "Bank",
             "query_id": 4,
@@ -728,8 +746,23 @@ class PhaseAOpenRCAExportTest(unittest.TestCase):
             ],
         }
         with self.assertRaises(ExportError) as ctx:
-            build_export_rows(entry)
+            build_prediction_payload(entry)
         self.assertIn("not supported", str(ctx.exception))
+
+    def test_mixed_systems_raises_export_error(self):
+        entries = [
+            {"system": "Bank",  "query_id": 0, "need_time": False,
+             "need_component": True, "need_reason": False,
+             "predictions": [{"score": 0.9, "component": "a"}]},
+            {"system": "Market", "query_id": 1, "need_time": False,
+             "need_component": True, "need_reason": False,
+             "predictions": [{"score": 0.9, "component": "b"}]},
+        ]
+        with self.assertRaises(ExportError) as ctx:
+            with tempfile.NamedTemporaryFile(mode="w", suffix=".csv",
+                                             delete=False) as f:
+                export_prediction_csv(entries, f.name)
+        self.assertIn("Multiple systems", str(ctx.exception))
 
     def test_missing_required_field_raises_export_error(self):
         entry = {
@@ -743,7 +776,7 @@ class PhaseAOpenRCAExportTest(unittest.TestCase):
             ],
         }
         with self.assertRaises(ExportError) as ctx:
-            build_export_rows(entry)
+            build_prediction_payload(entry)
         self.assertIn("component", str(ctx.exception))
 
     def test_old_format_missing_system_raises_error(self):
@@ -756,6 +789,60 @@ class PhaseAOpenRCAExportTest(unittest.TestCase):
         }
         with self.assertRaises(ExportError):
             _validate_entry(entry, 0)
+
+    def test_schema_csv_has_prediction_column_one_row_per_query(self):
+        entries = [
+            {"system": "Bank", "query_id": 0, "need_time": False,
+             "need_component": True, "need_reason": False,
+             "predictions": [{"score": 0.95, "component": "mysql01"}]},
+            {"system": "Bank", "query_id": 1, "need_time": True,
+             "need_component": False, "need_reason": False,
+             "predictions": [{"score": 0.88, "datetime": "2024-01-01 09:12:00"}]},
+            {"system": "Bank", "query_id": 2, "need_time": True,
+             "need_component": True, "need_reason": False,
+             "predictions": [
+                 {"score": 0.85, "datetime": "2024-01-01 09:40:00",
+                  "component": "redis01"},
+                 {"score": 0.95, "datetime": "2024-01-01 09:12:00",
+                  "component": "mysql01"},
+             ]},
+        ]
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".csv",
+                                         delete=False) as f:
+            output_path = f.name
+        try:
+            written = export_prediction_csv(entries, output_path)
+            self.assertEqual(written, len(entries))
+
+            with open(output_path, "r", newline="") as f:
+                reader = csv.DictReader(f)
+                rows = list(reader)
+
+            self.assertEqual(len(rows), len(entries),
+                             "CSV row count must equal number of query entries")
+
+            for row in rows:
+                self.assertIn("prediction", row)
+                payload = json.loads(row["prediction"])
+                self.assertIsInstance(payload, dict)
+                for key in payload:
+                    self.assertRegex(key, r"^\d+$")
+
+            self.assertEqual(json.loads(rows[2]["prediction"]),
+                             OrderedDict([
+                                 ("1", OrderedDict([
+                                     ("root cause occurrence datetime",
+                                      "2024-01-01 09:12:00"),
+                                     ("root cause component", "mysql01"),
+                                 ])),
+                                 ("2", OrderedDict([
+                                     ("root cause occurrence datetime",
+                                      "2024-01-01 09:40:00"),
+                                     ("root cause component", "redis01"),
+                                 ])),
+                             ]))
+        finally:
+            os.unlink(output_path)
 
 
 if __name__ == "__main__":

@@ -1,8 +1,16 @@
 """Phase 0.8 R6.1: Export predictions.json to OpenRCA-format prediction.csv.
 
-Reads predictions.json and produces prediction.csv with columns controlled
-by Query Mask (need_time, need_component). Reason-requiring queries are
-explicitly rejected (not yet supported).
+Each query is exactly one CSV row with columns:
+    row_id, prediction, [system]
+
+The `prediction` column is a JSON string with numbered root causes:
+    {
+      "1": {"root cause occurrence datetime": "...", "root cause component": "..."},
+      "2": {"root cause occurrence datetime": "...", "root cause component": "..."}
+    }
+
+Reason-requiring queries raise ExportError (not silently skipped).
+Mixed-system input raises ExportError.
 """
 
 import csv
@@ -19,6 +27,8 @@ _REQUIRED_ENTRY_FIELDS = [
     "system", "query_id", "predictions",
     "need_time", "need_component", "need_reason",
 ]
+
+EXPORT_FIELDNAMES = ["row_id", "prediction", "system"]
 
 
 class ExportError(Exception):
@@ -40,28 +50,20 @@ def _validate_entry(entry, idx):
                 f"got {type(entry[field]).__name__}")
 
 
-def _entry_fieldnames(entry):
-    """Determine CSV columns for an entry based on Query Mask."""
-    cols = ["query_id"]
-    if entry["need_time"]:
-        cols.append("occurrence_time")
-    if entry["need_component"]:
-        cols.append("component")
-    return cols
-
-
-def build_export_rows(entry):
-    """Build list of row dicts for one prediction entry.
+def build_prediction_payload(entry):
+    """Build a single prediction JSON payload dict for one query.
 
     Args:
         entry: Dict from predictions.json with system, query_id, predictions,
                need_time, need_component, need_reason.
 
     Returns:
-        List of OrderedDict rows, one per root cause.
+        Dict with string keys "1", "2", ... each mapping to a dict with
+        "root cause occurrence datetime" (if need_time) and/or
+        "root cause component" (if need_component).
 
     Raises:
-        ExportError: On unsupported masks, missing fields, or absent prediction fields.
+        ExportError: On unsupported masks, missing prediction fields.
     """
     _validate_entry(entry, f"system={entry.get('system', '?')} "
                     f"query_id={entry.get('query_id', '?')}")
@@ -77,8 +79,9 @@ def build_export_rows(entry):
             f"query_id={query_id}: need_reason=True is not supported "
             f"(reason inference not yet implemented)")
 
-    fieldnames = _entry_fieldnames(entry)
-    rows = []
+    if not predictions:
+        raise ExportError(
+            f"query_id={query_id}: 'predictions' list is empty")
 
     for pidx, pred in enumerate(predictions):
         if not isinstance(pred, dict):
@@ -87,7 +90,6 @@ def build_export_rows(entry):
         if "score" not in pred:
             raise ExportError(
                 f"query_id={query_id}: prediction[{pidx}] missing 'score'")
-
         if need_time and "datetime" not in pred:
             raise ExportError(
                 f"query_id={query_id}: prediction[{pidx}] missing "
@@ -97,57 +99,101 @@ def build_export_rows(entry):
                 f"query_id={query_id}: prediction[{pidx}] missing "
                 f"'component' (need_component=True)")
 
-        row = OrderedDict()
-        row["query_id"] = query_id
-        if need_time:
-            row["occurrence_time"] = pred["datetime"]
-        if need_component:
-            row["component"] = pred["component"]
-        rows.append(row)
-
-    if not rows:
-        return rows
-
+    ordered = list(predictions)
     if need_time:
-        rows.sort(key=lambda r: r["occurrence_time"])
-    return rows
+        ordered.sort(key=lambda p: p["datetime"])
+
+    payload = OrderedDict()
+    for idx, pred in enumerate(ordered, start=1):
+        item = OrderedDict()
+        if need_time:
+            item["root cause occurrence datetime"] = pred["datetime"]
+        if need_component:
+            item["root cause component"] = pred["component"]
+        payload[str(idx)] = item
+
+    return payload
 
 
-def export_prediction_csv(predictions, output_path):
+def build_export_row(entry):
+    """Build a single CSV row dict for one query.
+
+    Args:
+        entry: A prediction entry dict.
+
+    Returns:
+        {"row_id": ..., "prediction": ..., "system": ...}
+
+    Raises:
+        ExportError: On validation or unsupported masks.
+    """
+    _validate_entry(entry, f"system={entry.get('system', '?')} "
+                    f"query_id={entry.get('query_id', '?')}")
+
+    payload = build_prediction_payload(entry)
+
+    row = OrderedDict()
+    row["row_id"] = entry["query_id"]
+    row["prediction"] = json.dumps(payload, ensure_ascii=False)
+    row["system"] = entry["system"]
+    return row
+
+
+def export_prediction_csv(predictions, output_path, system=None):
     """Export a list of prediction entries to prediction.csv.
 
     Args:
         predictions: List of prediction entry dicts (from predictions.json).
         output_path: Path to write CSV file.
+        system: Optional system filter. If given, only export entries
+                matching this system name.
 
     Raises:
-        ExportError: On validation failures.
+        ExportError: On mixed systems, reason queries, or validation failures.
 
     Returns:
-        (written_count, skipped_reason_count) tuple.
+        Number of rows written.
     """
-    all_rows = []
-    reason_suppressed = 0
+    if not predictions:
+        raise ExportError("No prediction entries to export")
 
+    systems = set()
+    entries = []
     for idx, entry in enumerate(predictions):
         _validate_entry(entry, idx)
-        if entry["need_reason"]:
-            reason_suppressed += 1
+        systems.add(entry["system"])
+
+        if system is not None and entry["system"] != system:
             continue
+        entries.append(entry)
 
-        rows = build_export_rows(entry)
-        all_rows.extend(rows)
+    if not entries:
+        if system is not None:
+            raise ExportError(
+                f"No prediction entries found for system='{system}'")
+        raise ExportError("No prediction entries to export")
 
-    if not all_rows:
-        return 0, reason_suppressed
+    if len(systems) > 1 and system is None:
+        raise ExportError(
+            f"Multiple systems detected: {sorted(systems)}. "
+            f"Use --system to select one.")
 
-    fieldnames = list(all_rows[0].keys())
+    rows = []
+    reason_err = None
+    for idx, entry in enumerate(entries):
+        try:
+            row = build_export_row(entry)
+        except ExportError as e:
+            reason_err = e
+            raise
+        rows.append(row)
+
     with open(output_path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer = csv.DictWriter(f, fieldnames=EXPORT_FIELDNAMES)
         writer.writeheader()
-        writer.writerows(all_rows)
+        writer.writerows(rows)
 
-    return len(all_rows), reason_suppressed
+    return len(rows)
 
 
 def main():
@@ -157,6 +203,8 @@ def main():
                         help="Path to predictions.json")
     parser.add_argument("--output", type=str, default="prediction.csv",
                         help="Output CSV path")
+    parser.add_argument("--system", type=str, default=None,
+                        help="Only export predictions for this system")
     args = parser.parse_args()
 
     if not os.path.exists(args.predictions):
@@ -169,13 +217,12 @@ def main():
     print(f"Loaded {len(all_predictions)} prediction entries")
 
     try:
-        written, suppressed = export_prediction_csv(all_predictions, args.output)
+        written = export_prediction_csv(all_predictions, args.output, args.system)
     except ExportError as e:
         print(f"ERROR: {e}")
         return
 
-    print(f"Exported {written} rows to {args.output}"
-          + (f" ({suppressed} reason queries skipped)" if suppressed else ""))
+    print(f"Exported {written} rows to {args.output}")
 
 
 if __name__ == "__main__":
