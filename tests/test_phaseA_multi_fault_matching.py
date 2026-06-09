@@ -1,6 +1,7 @@
 import csv
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -12,6 +13,7 @@ import numpy as np
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
+sys.path.insert(0, str(REPO_ROOT / "tests"))
 
 from foundation.evaluation.query_parser import (
     OPENRCA_TZ, EvalTarget, parse_inference_queries,
@@ -841,6 +843,139 @@ class PhaseAOpenRCAExportTest(unittest.TestCase):
                                      ("root cause component", "redis01"),
                                  ])),
                              ]))
+        finally:
+            os.unlink(output_path)
+
+    # --- CLI exit-code tests ---
+
+    def test_cli_reason_query_exits_nonzero(self):
+        predictions = [{
+            "system": "Bank", "query_id": 0,
+            "need_time": False, "need_component": False,
+            "need_reason": True,
+            "predictions": [{"score": 0.9}],
+        }]
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json",
+                                         delete=False) as pred_f:
+            json.dump(predictions, pred_f)
+            pred_path = pred_f.name
+        with tempfile.NamedTemporaryFile(suffix=".csv", delete=False) as out_f:
+            out_path = out_f.name
+        try:
+            script = REPO_ROOT / "scripts" / "phaseA_export_openrca_csv.py"
+            result = subprocess.run(
+                [sys.executable, str(script),
+                 "--predictions", pred_path, "--output", out_path],
+                capture_output=True, text=True,
+            )
+            self.assertNotEqual(result.returncode, 0,
+                                "reason query should produce non-zero exit code")
+            self.assertIn("not supported", result.stderr)
+        finally:
+            os.unlink(pred_path)
+            os.unlink(out_path)
+
+    def test_cli_mixed_systems_exits_nonzero(self):
+        predictions = [
+            {"system": "Bank", "query_id": 0, "need_time": False,
+             "need_component": True, "need_reason": False,
+             "predictions": [{"score": 0.9, "component": "a"}]},
+            {"system": "Market", "query_id": 1, "need_time": False,
+             "need_component": True, "need_reason": False,
+             "predictions": [{"score": 0.9, "component": "b"}]},
+        ]
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json",
+                                         delete=False) as pred_f:
+            json.dump(predictions, pred_f)
+            pred_path = pred_f.name
+        with tempfile.NamedTemporaryFile(suffix=".csv", delete=False) as out_f:
+            out_path = out_f.name
+        try:
+            script = REPO_ROOT / "scripts" / "phaseA_export_openrca_csv.py"
+            result = subprocess.run(
+                [sys.executable, str(script),
+                 "--predictions", pred_path, "--output", out_path],
+                capture_output=True, text=True,
+            )
+            self.assertNotEqual(result.returncode, 0,
+                                "mixed systems without --system should exit non-zero")
+            self.assertIn("Multiple systems", result.stderr)
+        finally:
+            os.unlink(pred_path)
+            os.unlink(out_path)
+
+    def test_cli_missing_predictions_file_exits_nonzero(self):
+        script = REPO_ROOT / "scripts" / "phaseA_export_openrca_csv.py"
+        result = subprocess.run(
+            [sys.executable, str(script),
+             "--predictions", "/nonexistent/predictions.json",
+             "--output", "/dev/null"],
+            capture_output=True, text=True,
+        )
+        self.assertNotEqual(result.returncode, 0,
+                            "missing predictions file should exit non-zero")
+        self.assertIn("not found", result.stderr)
+
+    # --- OpenRCA official evaluator compatibility test ---
+
+    def test_official_evaluator_parses_exported_csv(self):
+        from fixtures.openrca_evaluate import (
+            parse_prediction_column, validate_prediction_csv,
+        )
+        entries = [
+            {"system": "Bank", "query_id": 0, "need_time": False,
+             "need_component": True, "need_reason": False,
+             "predictions": [{"score": 0.95, "component": "mysql01"}]},
+            {"system": "Bank", "query_id": 1, "need_time": True,
+             "need_component": False, "need_reason": False,
+             "predictions": [{"score": 0.88, "datetime": "2024-01-01 09:12:00"}]},
+            {"system": "Bank", "query_id": 2, "need_time": True,
+             "need_component": True, "need_reason": False,
+             "predictions": [
+                 {"score": 0.85, "datetime": "2024-01-01 09:40:00",
+                  "component": "redis01"},
+                 {"score": 0.95, "datetime": "2024-01-01 09:12:00",
+                  "component": "mysql01"},
+             ]},
+        ]
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".csv",
+                                         delete=False) as f:
+            output_path = f.name
+        try:
+            written = export_prediction_csv(entries, output_path)
+            self.assertEqual(written, len(entries))
+
+            parsed_rows, csv_rows = validate_prediction_csv(output_path)
+
+            self.assertEqual(len(csv_rows), len(entries),
+                             "CSV row count must equal number of query entries")
+
+            # Row 0: component-only
+            rcs0 = parse_prediction_column(csv_rows[0]["prediction"])
+            self.assertEqual(len(rcs0), 1)
+            self.assertEqual(rcs0[0]["root cause component"], "mysql01")
+            self.assertEqual(rcs0[0]["root cause occurrence datetime"], "")
+
+            # Row 1: time-only
+            rcs1 = parse_prediction_column(csv_rows[1]["prediction"])
+            self.assertEqual(len(rcs1), 1)
+            self.assertEqual(rcs1[0]["root cause occurrence datetime"],
+                             "2024-01-01 09:12:00")
+            self.assertEqual(rcs1[0]["root cause component"], "")
+
+            # Row 2: multi-fault time+component, single row
+            rcs2 = parse_prediction_column(csv_rows[2]["prediction"])
+            self.assertEqual(len(rcs2), 2,
+                             "multi-fault should yield 2 root causes, "
+                             "not expand to 2 CSV rows")
+            # Sorted by datetime ascending
+            self.assertEqual(rcs2[0]["root cause occurrence datetime"],
+                             "2024-01-01 09:12:00")
+            self.assertEqual(rcs2[0]["root cause component"], "mysql01")
+            self.assertEqual(rcs2[1]["root cause occurrence datetime"],
+                             "2024-01-01 09:40:00")
+            self.assertEqual(rcs2[1]["root cause component"], "redis01")
+
         finally:
             os.unlink(output_path)
 

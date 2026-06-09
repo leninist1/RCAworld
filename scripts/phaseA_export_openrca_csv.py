@@ -179,13 +179,8 @@ def export_prediction_csv(predictions, output_path, system=None):
             f"Use --system to select one.")
 
     rows = []
-    reason_err = None
     for idx, entry in enumerate(entries):
-        try:
-            row = build_export_row(entry)
-        except ExportError as e:
-            reason_err = e
-            raise
+        row = build_export_row(entry)
         rows.append(row)
 
     with open(output_path, "w", newline="") as f:
@@ -208,8 +203,9 @@ def main():
     args = parser.parse_args()
 
     if not os.path.exists(args.predictions):
-        print(f"ERROR: predictions file not found: {args.predictions}")
-        return
+        print(f"ERROR: predictions file not found: {args.predictions}",
+              file=sys.stderr)
+        raise SystemExit(1)
 
     with open(args.predictions, "r") as f:
         all_predictions = json.load(f)
@@ -219,8 +215,8 @@ def main():
     try:
         written = export_prediction_csv(all_predictions, args.output, args.system)
     except ExportError as e:
-        print(f"ERROR: {e}")
-        return
+        print(f"ERROR: {e}", file=sys.stderr)
+        raise SystemExit(1)
 
     print(f"Exported {written} rows to {args.output}")
 
