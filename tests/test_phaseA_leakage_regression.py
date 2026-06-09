@@ -28,6 +28,7 @@ from verify_phaseA_no_leakage import (
     _run_and_hash,
     _read_query_csv_ids,
     _validate_prediction_output,
+    create_safe_temp_dataset_view,
 )
 
 
@@ -356,6 +357,118 @@ class LeakageBoundaryTest(unittest.TestCase):
         self._make_query_csv(self.tmpdir, 3)
         ids = _read_query_csv_ids(str(self.tmpdir))
         self.assertEqual(ids, {0, 1, 2})
+
+    # --- Safe temp dataset view tests ---
+
+    def _make_orig_dataset(self, base_dir):
+        """Create a minimal original dataset with query.csv and telemetry/."""
+        orig = Path(base_dir) / "orig_data"
+        orig.mkdir()
+        query = orig / "query.csv"
+        with open(query, "w", newline="") as f:
+            writer = csv.DictWriter(
+                f, fieldnames=["task_index", "instruction", "scoring_points"])
+            writer.writeheader()
+            writer.writerow({"task_index": "task_1", "instruction": "Find",
+                             "scoring_points": "GT"})
+        tele = orig / "telemetry"
+        tele.mkdir()
+        (tele / "dummy.txt").write_text("big data")
+        return orig
+
+    def test_query_csv_temp_copy_mutation_does_not_affect_original(self):
+        orig = self._make_orig_dataset(self.tmpdir)
+        original_content = (orig / "query.csv").read_text()
+
+        temp = self.tmpdir / "temp_view"
+        create_safe_temp_dataset_view(str(orig), str(temp))
+
+        # Modify temp copy
+        (temp / "query.csv").write_text("MODIFIED CONTENT")
+
+        # Original must be unchanged
+        self.assertEqual((orig / "query.csv").read_text(), original_content)
+
+    def test_query_csv_symlink_becomes_regular_file(self):
+        orig = self._make_orig_dataset(self.tmpdir)
+        # Replace query.csv with a symlink to a real file elsewhere
+        real_content = "task_index,instruction,scoring_points\n"
+        "task_1,Find,GT\n"
+        real_file = self.tmpdir / "real_query.csv"
+        real_file.write_text(real_content)
+        (orig / "query.csv").unlink()
+        (orig / "query.csv").symlink_to(real_file.resolve())
+
+        temp = self.tmpdir / "temp_view"
+        create_safe_temp_dataset_view(str(orig), str(temp))
+
+        # Temp copy must be a regular file, not a symlink
+        temp_query = temp / "query.csv"
+        self.assertFalse(temp_query.is_symlink(),
+                         "temp query.csv must be a regular file, not symlink")
+        self.assertEqual(temp_query.read_text(), real_content)
+
+        # Modify temp copy; original (via symlink target) must be unchanged
+        temp_query.write_text("MODIFIED")
+        self.assertEqual(real_file.read_text(), real_content)
+
+    def test_record_csv_symlink_delete_preserves_original(self):
+        orig = self._make_orig_dataset(self.tmpdir)
+        real_content = "timestamp,component,action\n0,mysql01,deploy\n"
+        real_file = self.tmpdir / "real_record.csv"
+        real_file.write_text(real_content)
+        rec = orig / "record.csv"
+        rec.symlink_to(real_file.resolve())
+
+        temp = self.tmpdir / "temp_view"
+        create_safe_temp_dataset_view(str(orig), str(temp))
+
+        # Temp copy must be a regular file
+        temp_rec = temp / "record.csv"
+        self.assertFalse(temp_rec.is_symlink(),
+                         "temp record.csv must be a regular file")
+
+        # Delete temp copy
+        temp_rec.unlink()
+
+        # Original (via symlink target) must still exist and be intact
+        self.assertTrue(real_file.exists(),
+                        "original record.csv must survive temp deletion")
+        self.assertEqual(real_file.read_text(), real_content)
+
+    def test_telemetry_temp_path_is_symlink_to_original(self):
+        orig = self._make_orig_dataset(self.tmpdir)
+        original_tele = orig / "telemetry"
+
+        temp = self.tmpdir / "temp_view"
+        create_safe_temp_dataset_view(str(orig), str(temp))
+
+        temp_tele = temp / "telemetry"
+        self.assertTrue(temp_tele.is_symlink(),
+                        "temp telemetry must be a symlink")
+        self.assertEqual(temp_tele.resolve(), original_tele.resolve())
+
+    def test_telemetry_not_recursively_copied(self):
+        """Telemetry contents must not be duplicated as real files in temp."""
+        orig = self._make_orig_dataset(self.tmpdir)
+        original_tele = orig / "telemetry"
+        # Add a large-ish dummy file
+        (original_tele / "big_file.bin").write_bytes(b"x" * 10000)
+
+        temp = self.tmpdir / "temp_view"
+        create_safe_temp_dataset_view(str(orig), str(temp))
+
+        temp_tele = temp / "telemetry"
+        self.assertTrue(temp_tele.is_symlink())
+
+        # Verify no real file duplicate by checking that the big file's
+        # content at temp path is the same INODE (symlink → original)
+        big_orig = original_tele / "big_file.bin"
+        big_temp = temp_tele / "big_file.bin"
+        self.assertTrue(big_temp.exists(), "big file accessible via symlink")
+        self.assertEqual(
+            big_temp.resolve(), big_orig.resolve(),
+            "file must point to original, not a duplicate")
 
 
 if __name__ == "__main__":

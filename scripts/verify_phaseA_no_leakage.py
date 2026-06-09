@@ -101,6 +101,50 @@ def delete_record_csv(data_dir):
 
 
 # ---------------------------------------------------------------------------
+# Safe temp dataset view (avoids copying large telemetry)
+# ---------------------------------------------------------------------------
+
+def create_safe_temp_dataset_view(orig_data_dir, temp_data_dir):
+    """Create a lightweight temp view of an OpenRCA data directory.
+
+    Rules:
+    - query.csv: physically copied as a regular file (follows symlinks).
+    - record.csv: if present, physically copied as a regular file.
+    - telemetry/: symlinked to the original directory (read-only sharing).
+    - No large telemetry files are duplicated.
+
+    Args:
+        orig_data_dir: Path to the original OpenRCA system data dir.
+        temp_data_dir: Target directory for the temp view (created if needed).
+
+    Raises:
+        LeakageVerificationError: If mandatory files are missing.
+    """
+    orig = Path(orig_data_dir)
+    temp = Path(temp_data_dir)
+    temp.mkdir(parents=True, exist_ok=True)
+
+    query_orig = orig / "query.csv"
+    if not query_orig.exists():
+        raise LeakageVerificationError(
+            f"query.csv not found in {orig}")
+    query_tmp = temp / "query.csv"
+    shutil.copy2(str(query_orig), str(query_tmp))
+
+    record_orig = orig / "record.csv"
+    if record_orig.exists():
+        record_tmp = temp / "record.csv"
+        shutil.copy2(str(record_orig), str(record_tmp))
+
+    telemetry_orig = orig / "telemetry"
+    telemetry_tmp = temp / "telemetry"
+    if telemetry_orig.exists():
+        if telemetry_tmp.exists():
+            telemetry_tmp.unlink()
+        telemetry_tmp.symlink_to(telemetry_orig.resolve(), target_is_directory=True)
+
+
+# ---------------------------------------------------------------------------
 # Prediction output validation
 # ---------------------------------------------------------------------------
 
@@ -361,7 +405,7 @@ def main():
             # ---- Run A: original data ----
             print(f"[{'A':>2}/3] Run with ORIGINAL data")
             data_a = tmp / "original"
-            shutil.copytree(orig_data_dir, data_a, symlinks=True)
+            create_safe_temp_dataset_view(orig_data_dir, data_a)
             hashes["original"] = _run_and_hash(
                 args.system, data_a, model, state, ob_mean, ob_std,
                 args.method, args.all_zero_type,
@@ -373,7 +417,7 @@ def main():
             # ---- Run B: mutated scoring_points ----
             print(f"[{'B':>2}/3] Run with MUTATED scoring_points")
             data_b = tmp / "mutated_scoring"
-            shutil.copytree(orig_data_dir, data_b, symlinks=True)
+            create_safe_temp_dataset_view(orig_data_dir, data_b)
             mutate_scoring_points(str(data_b / "query.csv"))
             hashes["mutated_scoring"] = _run_and_hash(
                 args.system, data_b, model, state, ob_mean, ob_std,
@@ -386,7 +430,7 @@ def main():
             # ---- Run C: no record.csv ----
             print(f"[{'C':>2}/3] Run WITHOUT record.csv")
             data_c = tmp / "without_record"
-            shutil.copytree(orig_data_dir, data_c, symlinks=True)
+            create_safe_temp_dataset_view(orig_data_dir, data_c)
             delete_record_csv(data_c)
             hashes["without_record"] = _run_and_hash(
                 args.system, data_c, model, state, ob_mean, ob_std,
