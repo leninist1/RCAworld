@@ -16,6 +16,8 @@ from pathlib import Path
 from shutil import copytree
 from unittest.mock import patch
 
+import numpy as np
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
@@ -571,6 +573,158 @@ class LeakageCUDAPortabilityTest(unittest.TestCase):
             source,
             "phaseA_run_inference.py must not contain "
             "os.environ['CUDA_VISIBLE_DEVICES'] assignment")
+
+
+class OnsetHeadInferenceTest(unittest.TestCase):
+    """Onset head integration tests (Phase 0.9.1)."""
+
+    @classmethod
+    def setUpClass(cls):
+        sys.path.insert(0, str(REPO_ROOT / "src"))
+
+    def _make_test_data(self, T=100, N=5):
+        rng = np.random.default_rng(42)
+        residuals = rng.normal(0, 1, (T, N)).astype(np.float32)
+        residuals[50:60, 2] += 5.0
+        latents = rng.normal(0, 1, (T, N, 64)).astype(np.float32)
+        burn_in_mask = np.zeros(T, dtype=bool)
+        burn_in_mask[:40] = True
+        return residuals, latents, burn_in_mask
+
+    # ── Test A: default lambda_onset=0.0 preserves existing behavior ──
+
+    def test_a_default_lambda_zero_preserves_behavior(self):
+        from foundation.evaluation.strict_eval import compute_joint_scores
+
+        residuals, latents, burn_in_mask = self._make_test_data()
+        onset_dummy = np.ones_like(residuals) * 100.0
+
+        result_no_onset = compute_joint_scores(
+            residuals=residuals, latents=latents,
+            model_onset_scores=None, method="calibrated",
+            burn_in_mask=burn_in_mask,
+            lambda_onset=0.0,
+        )
+        result_with_onset_zero = compute_joint_scores(
+            residuals=residuals, latents=latents,
+            model_onset_scores=onset_dummy, method="calibrated",
+            burn_in_mask=burn_in_mask,
+            lambda_onset=0.0,
+        )
+        np.testing.assert_array_almost_equal(
+            result_no_onset.S, result_with_onset_zero.S, decimal=6,
+            err_msg="lambda_onset=0.0 must produce identical S "
+            "regardless of onset input")
+
+    # ── Test B: onset score actually affects S when lambda_onset > 0 ──
+
+    def test_b_onset_score_affects_result(self):
+        from foundation.evaluation.strict_eval import compute_joint_scores
+
+        T, N = 50, 3
+        rng = np.random.default_rng(1)
+        residuals = rng.normal(0, 0.5, (T, N)).astype(np.float32)
+        latents = rng.normal(0, 1, (T, N, 64)).astype(np.float32)
+        burn_in_mask = np.zeros(T, dtype=bool)
+        burn_in_mask[:15] = True
+
+        onset = np.zeros((T, N), dtype=np.float32)
+        onset[20, 1] = 10.0
+
+        result_off = compute_joint_scores(
+            residuals=residuals, latents=latents,
+            model_onset_scores=onset, method="calibrated",
+            burn_in_mask=burn_in_mask,
+            lambda_onset=0.0,
+        )
+        result_on = compute_joint_scores(
+            residuals=residuals, latents=latents,
+            model_onset_scores=onset, method="calibrated",
+            burn_in_mask=burn_in_mask,
+            lambda_onset=1.0,
+        )
+        self.assertNotAlmostEqual(
+            result_off.S[20, 1], result_on.S[20, 1], places=4,
+            msg="lambda_onset=1.0 must change S at onset peak")
+        self.assertGreater(
+            result_on.S[20, 1], result_off.S[20, 1],
+            msg="onset score must increase S at peak position")
+
+        idx_off = np.argmax(result_off.S.reshape(-1))
+        idx_on = np.argmax(result_on.S.reshape(-1))
+        t_off, c_off = idx_off // N, idx_off % N
+        t_on, c_on = idx_on // N, idx_on % N
+        self.assertTrue(
+            (c_on == 1 and t_on == 20) or (c_off != c_on),
+            msg=f"onset should influence argmax: "
+                f"off=({t_off},{c_off}) on=({t_on},{c_on})")
+
+    # ── Test C: overlapping window aggregation average ──
+
+    def test_c_overlapping_window_onset_averaging(self):
+        import numpy as np
+        from phaseA_run_inference import compute_residuals_and_latents, WS
+
+        T, N, D = 30, 2, 16
+        tensor = np.ones((T, N, D), dtype=np.float32)
+        type_idx = np.zeros(N, dtype=np.int32)
+        obs_mask = np.ones((T, N, D), dtype=np.float32)
+
+        class _MockModel:
+            def __init__(self):
+                self._call_count = 0
+
+            def apply(self, variables, x, type_idx, rng, obs_mask=None,
+                      use_posterior=False):
+                B = x.shape[0]
+                ws_inner = x.shape[1] - 1
+                Nx = x.shape[2]
+                res = np.zeros((B, ws_inner, Nx), dtype=np.float32)
+                h_seq = np.zeros((B, ws_inner, Nx, 256), dtype=np.float32)
+
+                onset_val = float(self._call_count + 1) * 2.0
+                self._call_count += 1
+                onset = np.full((B, ws_inner, Nx), onset_val,
+                                dtype=np.float32)
+
+                return {
+                    "residual": res,
+                    "h_seq": h_seq,
+                    "onset": {"onset_score": onset},
+                }
+
+        mock = _MockModel()
+        resid, h_states, onset_acc, coverage = compute_residuals_and_latents(
+            mock, None, tensor, type_idx, obs_mask, use_posterior=False,
+            ws=23)
+
+        covered = np.where(coverage)[0]
+        self.assertGreater(len(covered), 0, "at least some timesteps covered")
+
+        vals = [float(onset_acc[t, 0]) for t in covered[:5] if onset_acc[t, 0] > 0]
+        self.assertGreater(len(vals), 0, "at least one timestep has onset score > 0")
+
+        non_covered = np.where(~coverage)[0]
+        if len(non_covered) > 0:
+            for t in non_covered:
+                self.assertEqual(float(onset_acc[t, 0]), 0.0,
+                                 f"non-covered t={t} must have onset=0")
+
+    # ── Test D: prior-only is enforced ──
+
+    def test_d_prior_only_enforced(self):
+        import inspect
+        from phaseA_run_inference import run_inference, compute_residuals_and_latents
+
+        run_source = inspect.getsource(run_inference)
+        self.assertIn("use_posterior", run_source,
+                      "run_inference must reference use_posterior")
+        self.assertNotIn("use_posterior=True", run_source,
+                         "run_inference must not hardcode use_posterior=True")
+
+        cral_source = inspect.getsource(compute_residuals_and_latents)
+        self.assertIn("use_posterior=use_posterior", cral_source,
+                      "compute_residuals_and_latents must forward use_posterior")
 
 
 if __name__ == "__main__":

@@ -96,6 +96,8 @@ def compute_residuals_and_latents(model, params, tensor_norm, type_idx,
     resid_cnt = np.zeros((T, N), dtype=np.float32)
     h_acc = np.zeros((T, N, DET_DIM), dtype=np.float32)
     h_cnt = np.zeros((T, N), dtype=np.float32)
+    onset_acc = np.zeros((T, N), dtype=np.float32)
+    onset_cnt = np.zeros((T, N), dtype=np.float32)
     coverage = np.zeros(T, dtype=bool)
 
     stride = max(1, ws // 2)
@@ -113,7 +115,7 @@ def compute_residuals_and_latents(model, params, tensor_norm, type_idx,
         pos.append((start, end))
 
     if not windows:
-        return resid_acc, h_acc, coverage
+        return resid_acc, h_acc, onset_acc, coverage
 
     windows = np.stack(windows, axis=0)
     t_idx_j = jnp.array(type_idx)
@@ -127,6 +129,8 @@ def compute_residuals_and_latents(model, params, tensor_norm, type_idx,
             obs_mask=o_mask_j, use_posterior=use_posterior)
         res_b = np.array(out["residual"])
         h_b = np.array(out["h_seq"])
+        onset_b = np.array(out.get("onset", {}).get("onset_score",
+                   np.zeros_like(res_b)))
 
         for j, (s, e) in enumerate(pos[i:i + 8]):
             ns = min(res_b.shape[1], e - s)
@@ -135,6 +139,8 @@ def compute_residuals_and_latents(model, params, tensor_norm, type_idx,
                 if tg < T:
                     resid_acc[tg] += res_b[j, tt]
                     resid_cnt[tg] += 1.0
+                    onset_acc[tg] += onset_b[j, tt]
+                    onset_cnt[tg] += 1.0
                     coverage[tg] = True
             nh = min(h_b.shape[1], e - s)
             for tt in range(nh):
@@ -149,8 +155,13 @@ def compute_residuals_and_latents(model, params, tensor_norm, type_idx,
                 resid_acc[tt, n] /= resid_cnt[tt, n]
             if h_cnt[tt, n] > 0:
                 h_acc[tt, n] /= h_cnt[tt, n]
+            if onset_cnt[tt, n] > 0:
+                onset_acc[tt, n] /= onset_cnt[tt, n]
 
-    return np.nan_to_num(resid_acc, nan=0.0), h_acc, coverage
+    return (np.nan_to_num(resid_acc, nan=0.0),
+            h_acc,
+            np.nan_to_num(onset_acc, nan=0.0),
+            coverage)
 
 
 def serialize_prediction_item(iq, dt, component, score):
@@ -199,7 +210,8 @@ def build_prediction_entry(system, query_id, predictions, component_ranking, iq)
 
 
 def run_inference(sys_name, model, state, ob_mean, ob_std, use_posterior,
-                  scoring_method, all_zero_type, burn_in_min, resample_sec):
+                   scoring_method, all_zero_type, burn_in_min, resample_sec,
+                   lambda_onset=0.0):
     """Run inference for one system — ZERO GT access."""
     cfg = SYSTEM_CONFIGS[sys_name]
     data_dir = cfg["data_dir"]
@@ -295,7 +307,7 @@ def run_inference(sys_name, model, state, ob_mean, ob_std, use_posterior,
         obs_mask_sub_2d = (global_obs_mask[s_start:s_end].sum(axis=0) > 0).astype(np.float32)
         obs_mask_sub_2d = np.pad(obs_mask_sub_2d, ((0, 0), (0, MAX_D - 8)), mode='constant')
 
-        residuals, h_states, coverage_mask = compute_residuals_and_latents(
+        residuals, h_states, onset_scores, coverage_mask = compute_residuals_and_latents(
             model, state.params, tensor_sub, type_indices,
             obs_mask_sub_2d, use_posterior=use_posterior, ws=WS)
 
@@ -309,9 +321,10 @@ def run_inference(sys_name, model, state, ob_mean, ob_std, use_posterior,
 
         joint = compute_joint_scores(
             residuals=residuals, latents=h_states,
-            model_onset_scores=None, method=scoring_method,
+            model_onset_scores=onset_scores, method=scoring_method,
             burn_in_mask=burn_in_mask,
             lambda_residual=1.0, lambda_shift=0.5, lambda_early=0.3,
+            lambda_onset=lambda_onset,
             temporal_smooth_window=3,
         )
         joint.query_window_mask = qw_mask
@@ -357,6 +370,9 @@ def main():
     parser.add_argument('--burn_in_min', type=int, default=60)
     parser.add_argument('--resample_sec', type=int, default=120)
     parser.add_argument('--output', type=str, default='predictions.json')
+    parser.add_argument('--lambda-onset', type=float, default=0.0,
+                        help='Weight for learned onset head scores in joint S[t,c]; '
+                             'default 0.0 preserves Phase 0.8 behavior')
     args = parser.parse_args()
 
     print("=" * 60)
@@ -401,6 +417,7 @@ def main():
             all_zero_type=args.all_zero_type,
             burn_in_min=args.burn_in_min,
             resample_sec=args.resample_sec,
+            lambda_onset=args.lambda_onset,
         )
         elapsed = time.time() - t0
         all_predictions.extend(preds)

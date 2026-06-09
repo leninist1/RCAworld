@@ -222,6 +222,8 @@ def compute_residual_shift_earlyrise(
     lambda_shift: float = 0.5,
     lambda_early: float = 0.3,
     temporal_smooth_window: int = 3,
+    model_onset_scores: Optional[np.ndarray] = None,
+    lambda_onset: float = 0.0,
 ) -> JointScores:
     """Method B: Residual + latent shift + early-rise heuristic scoring.
 
@@ -234,6 +236,8 @@ def compute_residual_shift_earlyrise(
         burn_in_mask: [T] bool mask for burn-in (normal) period.
         lambda_*: Weights for each signal.
         temporal_smooth_window: Smoothing window size.
+        model_onset_scores: [T, N] learned onset head output (optional).
+        lambda_onset: Weight for learned onset scores.
 
     Returns:
         JointScores with S[t,c].
@@ -282,12 +286,21 @@ def compute_residual_shift_earlyrise(
          lambda_shift * Z_s +
          lambda_early * E_s)
 
+    # 6. Optional learned onset head blending
+    onset_raw_out = np.zeros((T, N))
+    if model_onset_scores is not None and lambda_onset > 0:
+        o_median, o_mad = compute_mad_normalization(model_onset_scores, burn_in_mask)
+        O = normalize_zscore(model_onset_scores, o_median, o_mad)
+        O_s = smooth(O, temporal_smooth_window)
+        S += lambda_onset * O_s
+        onset_raw_out = model_onset_scores
+
     return JointScores(
         S=S,
         residual=R_s,
         shift=Z_s,
         early_rise=E_s,
-        onset_raw=np.zeros((T, N)),
+        onset_raw=onset_raw_out,
         comp_raw=np.zeros(N),
     )
 
@@ -406,6 +419,8 @@ def compute_joint_scores(
         lambda_shift=lambda_shift,
         lambda_early=lambda_early,
         temporal_smooth_window=temporal_smooth_window,
+        model_onset_scores=model_onset_scores,
+        lambda_onset=lambda_onset,
     )
 
 
