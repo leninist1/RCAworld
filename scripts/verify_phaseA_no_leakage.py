@@ -5,7 +5,7 @@ hashes the outputs. If the three canonical JSON hashes are identical,
 the model does NOT leak scoring_points or record.csv content.
 
 Exit 0 = PASS (no leakage detected)
-Exit 1 = FAIL (leakage detected or runtime error)
+Exit 1 = FAIL (leakage detected, or verification could not run)
 """
 
 import argparse
@@ -42,6 +42,15 @@ from foundation.models import RCAWorldFoundation
 
 DEFAULT_CHECKPOINT = str(PROJECT_ROOT / "checkpoints" / "phaseA" / "best")
 DEFAULT_DATA_PATH = str(PROJECT_ROOT / "data" / "processed" / "hipster_dataset.h5")
+
+
+class LeakageVerificationError(RuntimeError):
+    """Raised when the verification cannot produce a meaningful result.
+
+    This includes: missing checkpoint, missing data files, or
+    inference returning zero predictions (all of which would
+    produce identical empty-hash false PASSes).
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -95,7 +104,18 @@ def delete_record_csv(data_dir):
 # ---------------------------------------------------------------------------
 
 def _load_model_and_state(checkpoint_path, data_path):
-    """Build the model, load the checkpoint and stats."""
+    """Build the model, load the checkpoint and stats.
+
+    Raises:
+        LeakageVerificationError: If checkpoint or data file is missing.
+    """
+    if not os.path.exists(checkpoint_path):
+        raise LeakageVerificationError(
+            f"Checkpoint not found: {checkpoint_path}")
+    if not os.path.exists(data_path):
+        raise LeakageVerificationError(
+            f"Data file not found: {data_path}")
+
     model = RCAWorldFoundation(
         common_dim=128, max_obs_dim=MAX_D, num_entity_types=3,
         det_dim=DET_DIM, stoch_dim=32, stoch_classes=32,
@@ -110,12 +130,9 @@ def _load_model_and_state(checkpoint_path, data_path):
     state = flax_train_state.TrainState.create(
         apply_fn=model.apply, params=v["params"], tx=tx)
 
-    if os.path.exists(checkpoint_path):
-        state = state.replace(
-            params=ocp.PyTreeCheckpointer().restore(checkpoint_path)["params"])
-        print(f"Loaded checkpoint: {checkpoint_path}")
-    else:
-        print(f"WARNING: checkpoint not found at {checkpoint_path}")
+    state = state.replace(
+        params=ocp.PyTreeCheckpointer().restore(checkpoint_path)["params"])
+    print(f"Loaded checkpoint: {checkpoint_path}")
 
     with h5py.File(data_path, "r") as f:
         ob_mean = f["stats/node_mean"][:].mean(axis=1).reshape(1, 1, 8)
@@ -131,7 +148,11 @@ def _load_model_and_state(checkpoint_path, data_path):
 def _run_and_hash(system, temp_data_dir, model, state, ob_mean, ob_std,
                   method, all_zero_type, burn_in_min, resample_sec,
                   output_path):
-    """Patch SYSTEM_CONFIGS data_dir, run inference, hash output."""
+    """Patch SYSTEM_CONFIGS data_dir, run inference, hash output.
+
+    Raises:
+        LeakageVerificationError: If inference returns zero predictions.
+    """
     orig_cfg = deepcopy(SYSTEM_CONFIGS[system])
     SYSTEM_CONFIGS[system] = {
         **orig_cfg, "data_dir": str(temp_data_dir),
@@ -148,6 +169,11 @@ def _run_and_hash(system, temp_data_dir, model, state, ob_mean, ob_std,
         elapsed = time.time() - t0
         print(f"  Inference completed in {elapsed:.1f}s, "
               f"{len(preds)} predictions")
+
+        if not preds:
+            raise LeakageVerificationError(
+                "Inference returned zero predictions; "
+                "refusing to report PASS")
 
         with open(output_path, "w") as f:
             json.dump(preds, f, indent=2, default=str)
@@ -216,8 +242,12 @@ def main():
     print("=" * 60)
 
     print("\nLoading model...")
-    model, state, ob_mean, ob_std = _load_model_and_state(
-        args.checkpoint, args.data_path)
+    try:
+        model, state, ob_mean, ob_std = _load_model_and_state(
+            args.checkpoint, args.data_path)
+    except LeakageVerificationError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        raise SystemExit(1)
     print("Model ready.\n")
 
     paths = {
@@ -230,43 +260,48 @@ def main():
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
 
-        # ---- Run A: original data ----
-        print(f"[{'A':>2}/3] Run with ORIGINAL data")
-        data_a = tmp / "original"
-        shutil.copytree(orig_data_dir, data_a, symlinks=True)
-        hashes["original"] = _run_and_hash(
-            args.system, data_a, model, state, ob_mean, ob_std,
-            args.method, args.all_zero_type,
-            args.burn_in_min, args.resample_sec,
-            str(paths["original"]),
-        )
-        print(f"  Hash: {hashes['original']}\n")
+        try:
+            # ---- Run A: original data ----
+            print(f"[{'A':>2}/3] Run with ORIGINAL data")
+            data_a = tmp / "original"
+            shutil.copytree(orig_data_dir, data_a, symlinks=True)
+            hashes["original"] = _run_and_hash(
+                args.system, data_a, model, state, ob_mean, ob_std,
+                args.method, args.all_zero_type,
+                args.burn_in_min, args.resample_sec,
+                str(paths["original"]),
+            )
+            print(f"  Hash: {hashes['original']}\n")
 
-        # ---- Run B: mutated scoring_points ----
-        print(f"[{'B':>2}/3] Run with MUTATED scoring_points")
-        data_b = tmp / "mutated_scoring"
-        shutil.copytree(orig_data_dir, data_b, symlinks=True)
-        mutate_scoring_points(str(data_b / "query.csv"))
-        hashes["mutated_scoring"] = _run_and_hash(
-            args.system, data_b, model, state, ob_mean, ob_std,
-            args.method, args.all_zero_type,
-            args.burn_in_min, args.resample_sec,
-            str(paths["mutated_scoring"]),
-        )
-        print(f"  Hash: {hashes['mutated_scoring']}\n")
+            # ---- Run B: mutated scoring_points ----
+            print(f"[{'B':>2}/3] Run with MUTATED scoring_points")
+            data_b = tmp / "mutated_scoring"
+            shutil.copytree(orig_data_dir, data_b, symlinks=True)
+            mutate_scoring_points(str(data_b / "query.csv"))
+            hashes["mutated_scoring"] = _run_and_hash(
+                args.system, data_b, model, state, ob_mean, ob_std,
+                args.method, args.all_zero_type,
+                args.burn_in_min, args.resample_sec,
+                str(paths["mutated_scoring"]),
+            )
+            print(f"  Hash: {hashes['mutated_scoring']}\n")
 
-        # ---- Run C: no record.csv ----
-        print(f"[{'C':>2}/3] Run WITHOUT record.csv")
-        data_c = tmp / "without_record"
-        shutil.copytree(orig_data_dir, data_c, symlinks=True)
-        delete_record_csv(data_c)
-        hashes["without_record"] = _run_and_hash(
-            args.system, data_c, model, state, ob_mean, ob_std,
-            args.method, args.all_zero_type,
-            args.burn_in_min, args.resample_sec,
-            str(paths["without_record"]),
-        )
-        print(f"  Hash: {hashes['without_record']}\n")
+            # ---- Run C: no record.csv ----
+            print(f"[{'C':>2}/3] Run WITHOUT record.csv")
+            data_c = tmp / "without_record"
+            shutil.copytree(orig_data_dir, data_c, symlinks=True)
+            delete_record_csv(data_c)
+            hashes["without_record"] = _run_and_hash(
+                args.system, data_c, model, state, ob_mean, ob_std,
+                args.method, args.all_zero_type,
+                args.burn_in_min, args.resample_sec,
+                str(paths["without_record"]),
+            )
+            print(f"  Hash: {hashes['without_record']}\n")
+
+        except LeakageVerificationError as e:
+            print(f"ERROR: {e}", file=sys.stderr)
+            raise SystemExit(1)
 
     # ---- Verdict ----
     print("=" * 60)

@@ -1,6 +1,9 @@
 """Unit tests for verify_phaseA_no_leakage.py helpers.
 
-Tests hash invariants, mutation safety, and temp-copy isolation.
+Tests hash invariants, mutation safety, temp-copy isolation,
+and boundary error conditions (missing checkpoint, missing data,
+empty predictions).
+
 Does NOT run full model inference.
 """
 
@@ -12,6 +15,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from shutil import copytree
+from unittest.mock import patch
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
@@ -20,6 +24,9 @@ from verify_phaseA_no_leakage import (
     canonical_hash,
     mutate_scoring_points,
     delete_record_csv,
+    LeakageVerificationError,
+    _load_model_and_state,
+    _run_and_hash,
 )
 
 
@@ -117,35 +124,113 @@ class LeakageMutationSafetyTest(unittest.TestCase):
         self.assertIn("MUTATED", mutated[0]["scoring_points"])
 
     def test_delete_record_csv_only_in_temp_copy(self):
-        # Create a minimal original data area with record.csv
         original_area = self.tmpdir / "original"
         original_area.mkdir()
         record_path = original_area / "record.csv"
         record_path.write_text("timestamp,component,action\n"
                                "0,mysql01,deploy\n")
 
-        # Copy to temp area
         copy_area = self.tmpdir / "copy"
         copytree(str(original_area), str(copy_area))
 
-        # Assert original record.csv is still intact
         self.assertTrue((original_area / "record.csv").exists())
 
-        # Delete in the copy only
         delete_record_csv(str(copy_area))
 
-        # Original must still exist
         self.assertTrue((original_area / "record.csv").exists(),
                         "record.csv in original area must survive")
-        # Copy must NOT have it
         self.assertFalse((copy_area / "record.csv").exists(),
                          "record.csv in temp copy must be deleted")
 
     def test_delete_record_csv_noop_when_file_missing(self):
         empty_dir = self.tmpdir / "no_record"
         empty_dir.mkdir()
-        # Should not raise
         delete_record_csv(str(empty_dir))
+
+
+class LeakageBoundaryTest(unittest.TestCase):
+    """Tests for false-PASS boundary conditions."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.tmpdir = Path(self._tmpdir.name)
+
+    def tearDown(self):
+        self._tmpdir.cleanup()
+
+    def test_load_model_raises_on_missing_checkpoint(self):
+        """Checkpoint-missing path MUST fire before any model init."""
+        # data_path can be anything because checkpoint check fires first
+        with self.assertRaises(LeakageVerificationError) as ctx:
+            _load_model_and_state(
+                checkpoint_path="/nonexistent/checkpoint/best",
+                data_path="/nonexistent/data.h5",
+            )
+        self.assertIn("Checkpoint not found", str(ctx.exception))
+
+    def test_load_model_raises_on_missing_data_path(self):
+        """Data-path-missing check fires after checkpoint passes."""
+        # Provide a checkpoint path that exists (a temp directory)
+        checkpoint_dir = self.tmpdir / "fake_ckpt"
+        checkpoint_dir.mkdir()
+        # data_path is nonexistent → second check fires
+        with self.assertRaises(LeakageVerificationError) as ctx:
+            _load_model_and_state(
+                checkpoint_path=str(checkpoint_dir),
+                data_path="/nonexistent/data.h5",
+            )
+        self.assertIn("Data file not found", str(ctx.exception))
+
+    @patch("verify_phaseA_no_leakage.run_inference")
+    def test_run_and_hash_raises_on_empty_predictions(self, mock_run):
+        """Empty predictions → LeakageVerificationError, not a hash."""
+        mock_run.return_value = []
+
+        from verify_phaseA_no_leakage import SYSTEM_CONFIGS
+
+        system = "Bank"
+        temp_data_dir = self.tmpdir / "data"
+        temp_data_dir.mkdir()
+        output_path = self.tmpdir / "out.json"
+
+        orig_cfg = dict(SYSTEM_CONFIGS)
+
+        with self.assertRaises(LeakageVerificationError) as ctx:
+            _run_and_hash(
+                system=system,
+                temp_data_dir=str(temp_data_dir),
+                model=None, state=None,
+                ob_mean=None, ob_std=None,
+                method="calibrated", all_zero_type=False,
+                burn_in_min=60, resample_sec=120,
+                output_path=str(output_path),
+            )
+        self.assertIn("zero predictions", str(ctx.exception))
+        self.assertEqual(SYSTEM_CONFIGS, orig_cfg,
+                         "SYSTEM_CONFIGS must be restored after error")
+
+    @patch("verify_phaseA_no_leakage.run_inference")
+    def test_run_and_hash_returns_hash_for_non_empty_predictions(self, mock_run):
+        """Non-empty predictions → valid hash returned."""
+        mock_run.return_value = [{"query_id": 0, "predictions": []}]
+
+        system = "Bank"
+        temp_data_dir = self.tmpdir / "data"
+        temp_data_dir.mkdir()
+        output_path = self.tmpdir / "out.json"
+
+        h = _run_and_hash(
+            system=system,
+            temp_data_dir=str(temp_data_dir),
+            model=None, state=None,
+            ob_mean=None, ob_std=None,
+            method="calibrated", all_zero_type=False,
+            burn_in_min=60, resample_sec=120,
+            output_path=str(output_path),
+        )
+        self.assertIsInstance(h, str)
+        self.assertEqual(len(h), 64)
+        self.assertTrue(output_path.exists())
 
 
 if __name__ == "__main__":
