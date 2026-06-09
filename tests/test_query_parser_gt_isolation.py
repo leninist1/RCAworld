@@ -13,6 +13,8 @@ from foundation.evaluation.query_parser import (
     load_eval_targets,
     parse_fault_count,
     parse_inference_queries,
+    parse_observation_window,
+    QueryParseError,
 )
 
 
@@ -164,6 +166,108 @@ class ParseInferenceQueriesGtIsolationTest(unittest.TestCase):
                 eval_targets[0].root_causes,
                 [("service_a", "2024-01-01 01:10:00", "cpu saturation", 1)],
             )
+
+
+class ParseObservationWindowTest(unittest.TestCase):
+    """Tests for robust observation window parsing (6.2.1.6b)."""
+
+    def test_standard_from_to_format(self):
+        inst = "On March 4, 2021, from 14:30 to 15:00, a single failure was detected."
+        ws, we = parse_observation_window(inst)
+        self.assertEqual(ws.year, 2021)
+        self.assertEqual(ws.month, 3)
+        self.assertEqual(ws.day, 4)
+        self.assertEqual(ws.hour, 14)
+        self.assertEqual(ws.minute, 30)
+        self.assertEqual(we.hour, 15)
+        self.assertEqual(we.minute, 0)
+
+    def test_within_the_time_range_of(self):
+        inst = ("On March 4, 2021, within the time range of 14:30 to 15:00, "
+                "a single failure was detected.")
+        ws, we = parse_observation_window(inst)
+        self.assertEqual(ws.hour, 14)
+        self.assertEqual(ws.minute, 30)
+        self.assertEqual(we.hour, 15)
+        self.assertEqual(we.minute, 0)
+        self.assertEqual(ws.day, 4)
+
+    def test_between_the_time_range_of(self):
+        inst = ("On March 10, 2021, between the time range of 04:30 to 05:00, "
+                "the system experienced one failure.")
+        ws, we = parse_observation_window(inst)
+        self.assertEqual(ws.hour, 4)
+        self.assertEqual(ws.minute, 30)
+        self.assertEqual(we.hour, 5)
+        self.assertEqual(we.minute, 0)
+        self.assertEqual(ws.day, 10)
+
+    def test_during_the_time_range_of(self):
+        inst = ("On March 23, 2021, during the time range of 00:00 to 00:30, "
+                "there was a recorded failure.")
+        ws, we = parse_observation_window(inst)
+        self.assertEqual(ws.hour, 0)
+        self.assertEqual(ws.minute, 0)
+        self.assertEqual(we.hour, 0)
+        self.assertEqual(we.minute, 30)
+        self.assertEqual(ws.day, 23)
+
+    def test_cross_midnight_with_second_date_at(self):
+        inst = ("During the specified time range of March 6, 2021, "
+                "from 23:30 to March 7, 2021, at 00:00, "
+                "there was one failure observed.")
+        ws, we = parse_observation_window(inst)
+        self.assertEqual(ws.month, 3)
+        self.assertEqual(ws.day, 6)
+        self.assertEqual(ws.hour, 23)
+        self.assertEqual(ws.minute, 30)
+        self.assertEqual(we.month, 3)
+        self.assertEqual(we.day, 7)
+        self.assertEqual(we.hour, 0)
+        self.assertEqual(we.minute, 0)
+        self.assertGreater(we, ws)
+
+    def test_cross_midnight_with_second_date_no_at(self):
+        inst = ("During the specified time range of March 9, 2021, "
+                "from 23:30 to March 10, 2021, 00:00, "
+                "there was a single failure.")
+        ws, we = parse_observation_window(inst)
+        self.assertEqual(ws.month, 3)
+        self.assertEqual(ws.day, 9)
+        self.assertEqual(ws.hour, 23)
+        self.assertEqual(ws.minute, 30)
+        self.assertEqual(we.month, 3)
+        self.assertEqual(we.day, 10)
+        self.assertEqual(we.hour, 0)
+        self.assertEqual(we.minute, 0)
+        self.assertGreater(we, ws)
+
+    def test_single_date_cross_midnight(self):
+        inst = "On March 6, 2021, from 23:30 to 00:00, a failure was detected."
+        ws, we = parse_observation_window(inst)
+        self.assertEqual(ws.day, 6)
+        self.assertEqual(ws.hour, 23)
+        self.assertEqual(ws.minute, 30)
+        self.assertEqual(we.day, 7)
+        self.assertEqual(we.hour, 0)
+        self.assertEqual(we.minute, 0)
+        self.assertGreater(we, ws)
+
+    def test_unparseable_raises_QueryParseError_with_ids(self):
+        instruction = "This instruction has no date and no time at all."
+        with tempfile.TemporaryDirectory() as tmpdir:
+            query_csv = Path(tmpdir) / "query.csv"
+            write_query_csv(
+                query_csv,
+                ["task_index", "instruction"],
+                {
+                    "task_index": "task_1",
+                    "instruction": instruction,
+                },
+            )
+            with self.assertRaises(QueryParseError) as ctx:
+                parse_inference_queries(str(query_csv))
+            self.assertIn("query_ids=[0]", str(ctx.exception))
 
 
 if __name__ == "__main__":

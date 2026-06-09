@@ -144,6 +144,12 @@ _MONTH_MAP = {
     "may": 5, "june": 6, "july": 7, "august": 8,
     "september": 9, "october": 10, "november": 11, "december": 12,
 }
+_TIME_HHMM_PATTERN = re.compile(r'\b(\d{1,2}):(\d{2})\b')
+
+
+class QueryParseError(ValueError):
+    """Raised when a query.csv row cannot be parsed into an InferenceQuery."""
+    pass
 
 
 def _make_utc8_dt(year: int, month: int, day: int,
@@ -173,6 +179,65 @@ def parse_time_range_from_text(text: str) -> Optional[Tuple[int, int, int, int]]
     if not m:
         return None
     return int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4))
+
+
+def parse_observation_window(
+    instruction: str,
+) -> Optional[Tuple[datetime, datetime]]:
+    """Parse observation window (start, end) from instruction text.
+
+    Extracts all English dates and HH:MM times in text order, then pairs
+    the first two times with the nearest preceding date to form a window.
+
+    Args:
+        instruction: Raw instruction text.
+
+    Returns:
+        (window_start, window_end) as UTC+8 aware datetimes, or None if
+        fewer than 1 date or 2 HH:MM times are found.
+    """
+    dates = []
+    for m in _DATE_PATTERN.finditer(instruction):
+        month = _MONTH_MAP.get(m.group(1).lower())
+        if month is None:
+            continue
+        day = int(m.group(2))
+        year = int(m.group(3))
+        dates.append((m.start(), _make_utc8_dt(year, month, day)))
+
+    times = []
+    for m in _TIME_HHMM_PATTERN.finditer(instruction):
+        hour = int(m.group(1))
+        minute = int(m.group(2))
+        times.append((m.start(), hour, minute))
+
+    if len(dates) < 1 or len(times) < 2:
+        return None
+
+    def _date_for_time(time_pos):
+        best = None
+        for dpos, dt in dates:
+            if dpos < time_pos:
+                if best is None or dpos > best[0]:
+                    best = (dpos, dt)
+        if best is None:
+            return dates[0][1]
+        return best[1]
+
+    _, sh, sm = times[0]
+    start_date = _date_for_time(times[0][0])
+    window_start = _make_utc8_dt(
+        start_date.year, start_date.month, start_date.day, sh, sm)
+
+    _, eh, em = times[1]
+    end_date = _date_for_time(times[1][0])
+    window_end = _make_utc8_dt(
+        end_date.year, end_date.month, end_date.day, eh, em)
+
+    if window_end <= window_start:
+        window_end += timedelta(days=1)
+
+    return window_start, window_end
 
 
 def _parse_gt_times(scoring_points: str) -> Dict[int, Tuple[str, int]]:
@@ -239,18 +304,11 @@ def _parse_query_row_to_inference(task: str, instruction: str, idx: int) -> Opti
     This function reads ONLY task_index and instruction columns.
     It NEVER reads scoring_points.
     """
-    date = parse_date_from_text(instruction)
-    time_range = parse_time_range_from_text(instruction)
-    if date is None or time_range is None:
+    window = parse_observation_window(instruction)
+    if window is None:
         return None
 
-    sh, sm, eh, em = time_range
-    window_start = _make_utc8_dt(date.year, date.month, date.day, sh, sm)
-    window_end = _make_utc8_dt(date.year, date.month, date.day, eh, em)
-
-    # Handle cross-midnight: if window_end <= window_start, it wraps to next day
-    if window_end <= window_start:
-        window_end += timedelta(days=1)
+    window_start, window_end = window
 
     fields = TASK_FIELD_MAP.get(task, {})
     need_time = fields.get("need_time", True)
@@ -321,6 +379,9 @@ def parse_inference_queries(query_csv_path: str) -> List[InferenceQuery]:
 
     Returns:
         List of InferenceQuery objects (one per row).
+
+    Raises:
+        QueryParseError: If any row cannot be parsed (no silent skipping).
     """
     df = pd.read_csv(
         query_csv_path,
@@ -330,13 +391,22 @@ def parse_inference_queries(query_csv_path: str) -> List[InferenceQuery]:
         ],
     )
     inference_queries: List[InferenceQuery] = []
+    failed_rows = []
 
     for idx, row in df.iterrows():
         task = str(row.get("task_index", ""))
         instruction = str(row.get("instruction", ""))
         iq = _parse_query_row_to_inference(task, instruction, idx)
-        if iq is not None:
+        if iq is None:
+            failed_rows.append((idx, instruction))
+        else:
             inference_queries.append(iq)
+
+    if failed_rows:
+        failed_ids = [f[0] for f in failed_rows]
+        raise QueryParseError(
+            f"Failed to parse {len(failed_rows)} query rows: "
+            f"query_ids={failed_ids}")
 
     return inference_queries
 
