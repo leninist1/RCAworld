@@ -514,5 +514,34 @@ class LeakageBoundaryTest(unittest.TestCase):
         self.assertIn("telemetry/ not found", str(ctx.exception))
 
 
+class LeakageCUDAPortabilityTest(unittest.TestCase):
+    """CUDA visibility portability tests (6.2.1.5)."""
+
+    def test_import_does_not_overwrite_preset_cuda_visible_devices(self):
+        saved = os.environ.get("CUDA_VISIBLE_DEVICES")
+        os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+        try:
+            import importlib
+            import scripts.verify_phaseA_no_leakage as _mod
+            importlib.reload(_mod)
+            self.assertEqual(
+                os.environ["CUDA_VISIBLE_DEVICES"], "0",
+                "import must not overwrite caller's CUDA_VISIBLE_DEVICES")
+        finally:
+            if saved is not None:
+                os.environ["CUDA_VISIBLE_DEVICES"] = saved
+            else:
+                del os.environ["CUDA_VISIBLE_DEVICES"]
+
+    def test_source_contains_no_cuda_visible_devices_assignment(self):
+        script_path = REPO_ROOT / "scripts" / "verify_phaseA_no_leakage.py"
+        source = script_path.read_text()
+        self.assertNotIn(
+            'os.environ["CUDA_VISIBLE_DEVICES"]',
+            source,
+            "script source must not contain "
+            "os.environ[\"CUDA_VISIBLE_DEVICES\"] assignment")
+
+
 if __name__ == "__main__":
     unittest.main()
