@@ -47,9 +47,10 @@ DEFAULT_DATA_PATH = str(PROJECT_ROOT / "data" / "processed" / "hipster_dataset.h
 class LeakageVerificationError(RuntimeError):
     """Raised when the verification cannot produce a meaningful result.
 
-    This includes: missing checkpoint, missing data files, or
-    inference returning zero predictions (all of which would
-    produce identical empty-hash false PASSes).
+    This includes: missing checkpoint, missing data files,
+    inference returning zero/malformed predictions, or
+    query coverage mismatch (any of which would produce
+    identical-empty-hash false PASSes).
     """
 
 
@@ -97,6 +98,97 @@ def delete_record_csv(data_dir):
     record_path = Path(data_dir) / "record.csv"
     if record_path.exists():
         record_path.unlink()
+
+
+# ---------------------------------------------------------------------------
+# Prediction output validation
+# ---------------------------------------------------------------------------
+
+def _read_query_csv_ids(data_dir):
+    """Read query.csv from data_dir and return the set of expected query_ids.
+
+    Query IDs are 0-based row indices (matching InferenceQuery.query_id
+    from parse_inference_queries).
+    """
+    query_path = Path(data_dir) / "query.csv"
+    if not query_path.exists():
+        raise LeakageVerificationError(
+            f"query.csv not found in temp data dir: {data_dir}")
+    row_count = 0
+    with open(query_path, "r", newline="") as f:
+        reader = csv.reader(f)
+        next(reader)  # skip header
+        for _ in reader:
+            row_count += 1
+    return set(range(row_count))
+
+
+def _validate_prediction_output(preds, expected_query_ids):
+    """Validate prediction output structure and query coverage.
+
+    Args:
+        preds: Output from run_inference().
+        expected_query_ids: Set of expected query_id integers.
+
+    Raises:
+        LeakageVerificationError: On any structural or coverage violation.
+    """
+    if not isinstance(preds, list):
+        raise LeakageVerificationError(
+            f"predictions must be a list, got {type(preds).__name__}")
+
+    if not preds:
+        raise LeakageVerificationError(
+            "Inference returned zero predictions; refusing to report PASS")
+
+    seen_ids = set()
+    for idx, entry in enumerate(preds):
+        if not isinstance(entry, dict):
+            raise LeakageVerificationError(
+                f"predictions[{idx}] must be a dict, "
+                f"got {type(entry).__name__}")
+
+        if "query_id" not in entry:
+            raise LeakageVerificationError(
+                f"predictions[{idx}] missing required field 'query_id'")
+
+        qid = entry["query_id"]
+
+        if "predictions" not in entry:
+            raise LeakageVerificationError(
+                f"predictions[{idx}] (query_id={qid}) "
+                f"missing required field 'predictions'")
+
+        pred_list = entry["predictions"]
+        if not isinstance(pred_list, list):
+            raise LeakageVerificationError(
+                f"predictions[{idx}] (query_id={qid}) "
+                f"'predictions' must be a list, "
+                f"got {type(pred_list).__name__}")
+
+        if not pred_list:
+            raise LeakageVerificationError(
+                f"predictions[{idx}] (query_id={qid}) "
+                f"'predictions' list is empty")
+
+        if qid in seen_ids:
+            raise LeakageVerificationError(
+                f"Duplicate query_id={qid} in prediction output")
+        seen_ids.add(qid)
+
+    output_ids = seen_ids
+
+    if output_ids != expected_query_ids:
+        missing = expected_query_ids - output_ids
+        extra = output_ids - expected_query_ids
+        parts = []
+        if missing:
+            parts.append(f"missing query_ids: {sorted(missing)}")
+        if extra:
+            parts.append(f"extra query_ids: {sorted(extra)}")
+        raise LeakageVerificationError(
+            "Prediction output query coverage mismatch (expected "
+            f"{len(expected_query_ids)} queries): " + "; ".join(parts))
 
 
 # ---------------------------------------------------------------------------
@@ -150,8 +242,12 @@ def _run_and_hash(system, temp_data_dir, model, state, ob_mean, ob_std,
                   output_path):
     """Patch SYSTEM_CONFIGS data_dir, run inference, hash output.
 
+    Validates prediction output structure and query coverage
+    before computing hash.
+
     Raises:
-        LeakageVerificationError: If inference returns zero predictions.
+        LeakageVerificationError: If inference returns zero predictions,
+            malformed output, or query coverage mismatch.
     """
     orig_cfg = deepcopy(SYSTEM_CONFIGS[system])
     SYSTEM_CONFIGS[system] = {
@@ -170,10 +266,11 @@ def _run_and_hash(system, temp_data_dir, model, state, ob_mean, ob_std,
         print(f"  Inference completed in {elapsed:.1f}s, "
               f"{len(preds)} predictions")
 
-        if not preds:
-            raise LeakageVerificationError(
-                "Inference returned zero predictions; "
-                "refusing to report PASS")
+        expected_ids = _read_query_csv_ids(temp_data_dir)
+        _validate_prediction_output(preds, expected_ids)
+
+        print(f"  Validation OK: {len(preds)} queries, "
+              f"all have non-empty predictions")
 
         with open(output_path, "w") as f:
             json.dump(preds, f, indent=2, default=str)

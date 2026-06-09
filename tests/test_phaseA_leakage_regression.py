@@ -1,8 +1,7 @@
 """Unit tests for verify_phaseA_no_leakage.py helpers.
 
 Tests hash invariants, mutation safety, temp-copy isolation,
-and boundary error conditions (missing checkpoint, missing data,
-empty predictions).
+boundary error conditions, and prediction output validation.
 
 Does NOT run full model inference.
 """
@@ -27,6 +26,8 @@ from verify_phaseA_no_leakage import (
     LeakageVerificationError,
     _load_model_and_state,
     _run_and_hash,
+    _read_query_csv_ids,
+    _validate_prediction_output,
 )
 
 
@@ -158,9 +159,21 @@ class LeakageBoundaryTest(unittest.TestCase):
     def tearDown(self):
         self._tmpdir.cleanup()
 
+    def _make_query_csv(self, data_dir, num_rows):
+        """Write a minimal query.csv with num_rows data rows."""
+        query_path = Path(data_dir) / "query.csv"
+        with open(query_path, "w", newline="") as f:
+            writer = csv.DictWriter(
+                f, fieldnames=["task_index", "instruction", "scoring_points"])
+            writer.writeheader()
+            for i in range(num_rows):
+                writer.writerow({
+                    "task_index": f"task_{i + 1}",
+                    "instruction": f"Instruction {i}",
+                    "scoring_points": f"GT point {i}",
+                })
+
     def test_load_model_raises_on_missing_checkpoint(self):
-        """Checkpoint-missing path MUST fire before any model init."""
-        # data_path can be anything because checkpoint check fires first
         with self.assertRaises(LeakageVerificationError) as ctx:
             _load_model_and_state(
                 checkpoint_path="/nonexistent/checkpoint/best",
@@ -169,11 +182,8 @@ class LeakageBoundaryTest(unittest.TestCase):
         self.assertIn("Checkpoint not found", str(ctx.exception))
 
     def test_load_model_raises_on_missing_data_path(self):
-        """Data-path-missing check fires after checkpoint passes."""
-        # Provide a checkpoint path that exists (a temp directory)
         checkpoint_dir = self.tmpdir / "fake_ckpt"
         checkpoint_dir.mkdir()
-        # data_path is nonexistent → second check fires
         with self.assertRaises(LeakageVerificationError) as ctx:
             _load_model_and_state(
                 checkpoint_path=str(checkpoint_dir),
@@ -181,56 +191,171 @@ class LeakageBoundaryTest(unittest.TestCase):
             )
         self.assertIn("Data file not found", str(ctx.exception))
 
-    @patch("verify_phaseA_no_leakage.run_inference")
-    def test_run_and_hash_raises_on_empty_predictions(self, mock_run):
-        """Empty predictions → LeakageVerificationError, not a hash."""
-        mock_run.return_value = []
+    # --- Output structure validation (unit-level, no run_inference mock) ---
 
-        from verify_phaseA_no_leakage import SYSTEM_CONFIGS
+    def test_validate_empty_list_raises(self):
+        expected = {0, 1, 2}
+        with self.assertRaises(LeakageVerificationError) as ctx:
+            _validate_prediction_output([], expected)
+        self.assertIn("zero predictions", str(ctx.exception))
 
+    def test_validate_empty_predictions_per_query_raises(self):
+        self._make_query_csv(self.tmpdir, 2)
+        expected = _read_query_csv_ids(self.tmpdir)
+        preds = [
+            {"query_id": 0, "predictions": [{"component": "a"}]},
+            {"query_id": 1, "predictions": []},
+        ]
+        with self.assertRaises(LeakageVerificationError) as ctx:
+            _validate_prediction_output(preds, expected)
+        self.assertIn("predictions' list is empty", str(ctx.exception))
+
+    def test_validate_missing_query_id_field_raises(self):
+        self._make_query_csv(self.tmpdir, 1)
+        expected = _read_query_csv_ids(self.tmpdir)
+        preds = [{"predictions": [{"component": "a"}]}]
+        with self.assertRaises(LeakageVerificationError) as ctx:
+            _validate_prediction_output(preds, expected)
+        self.assertIn("missing required field 'query_id'", str(ctx.exception))
+
+    def test_validate_duplicate_query_id_raises(self):
+        self._make_query_csv(self.tmpdir, 2)
+        expected = _read_query_csv_ids(self.tmpdir)
+        preds = [
+            {"query_id": 0, "predictions": [{"component": "x"}]},
+            {"query_id": 0, "predictions": [{"component": "y"}]},
+        ]
+        with self.assertRaises(LeakageVerificationError) as ctx:
+            _validate_prediction_output(preds, expected)
+        self.assertIn("Duplicate query_id", str(ctx.exception))
+
+    def test_validate_missing_query_in_output_raises(self):
+        self._make_query_csv(self.tmpdir, 3)
+        expected = _read_query_csv_ids(self.tmpdir)
+        # Only 2 of 3 queries in output
+        preds = [
+            {"query_id": 0, "predictions": [{"component": "a"}]},
+            {"query_id": 1, "predictions": [{"component": "b"}]},
+        ]
+        with self.assertRaises(LeakageVerificationError) as ctx:
+            _validate_prediction_output(preds, expected)
+        self.assertIn("missing query_ids", str(ctx.exception))
+
+    def test_validate_extra_query_in_output_raises(self):
+        self._make_query_csv(self.tmpdir, 1)
+        expected = _read_query_csv_ids(self.tmpdir)
+        # Output has query_id=1 which is not expected
+        preds = [
+            {"query_id": 0, "predictions": [{"component": "a"}]},
+            {"query_id": 1, "predictions": [{"component": "b"}]},
+        ]
+        with self.assertRaises(LeakageVerificationError) as ctx:
+            _validate_prediction_output(preds, expected)
+        self.assertIn("extra query_ids", str(ctx.exception))
+
+    def test_validate_valid_output_passes(self):
+        self._make_query_csv(self.tmpdir, 2)
+        expected = _read_query_csv_ids(self.tmpdir)
+        preds = [
+            {"query_id": 0, "predictions": [{"component": "a"}]},
+            {"query_id": 1, "predictions": [
+                {"component": "b"}, {"component": "c"},
+            ]},
+        ]
+        # Should not raise
+        _validate_prediction_output(preds, expected)
+
+    # --- _run_and_hash integration tests (with mocked run_inference) ---
+
+    def _run_and_hash_wrapper(self, mock_return, data_dir=None):
+        """Helper to call _run_and_hash with mocked run_inference."""
+        if data_dir is None:
+            data_dir = self.tmpdir
         system = "Bank"
-        temp_data_dir = self.tmpdir / "data"
-        temp_data_dir.mkdir()
         output_path = self.tmpdir / "out.json"
-
+        from verify_phaseA_no_leakage import SYSTEM_CONFIGS
         orig_cfg = dict(SYSTEM_CONFIGS)
 
-        with self.assertRaises(LeakageVerificationError) as ctx:
-            _run_and_hash(
+        with patch("verify_phaseA_no_leakage.run_inference",
+                   return_value=mock_return):
+            h = _run_and_hash(
                 system=system,
-                temp_data_dir=str(temp_data_dir),
+                temp_data_dir=str(data_dir),
                 model=None, state=None,
                 ob_mean=None, ob_std=None,
                 method="calibrated", all_zero_type=False,
                 burn_in_min=60, resample_sec=120,
                 output_path=str(output_path),
             )
-        self.assertIn("zero predictions", str(ctx.exception))
         self.assertEqual(SYSTEM_CONFIGS, orig_cfg,
-                         "SYSTEM_CONFIGS must be restored after error")
+                         "SYSTEM_CONFIGS must be restored")
+        return h
 
-    @patch("verify_phaseA_no_leakage.run_inference")
-    def test_run_and_hash_returns_hash_for_non_empty_predictions(self, mock_run):
-        """Non-empty predictions → valid hash returned."""
-        mock_run.return_value = [{"query_id": 0, "predictions": []}]
-
-        system = "Bank"
-        temp_data_dir = self.tmpdir / "data"
-        temp_data_dir.mkdir()
-        output_path = self.tmpdir / "out.json"
-
-        h = _run_and_hash(
-            system=system,
-            temp_data_dir=str(temp_data_dir),
-            model=None, state=None,
-            ob_mean=None, ob_std=None,
-            method="calibrated", all_zero_type=False,
-            burn_in_min=60, resample_sec=120,
-            output_path=str(output_path),
-        )
+    def test_run_and_hash_valid_output_succeeds(self):
+        self._make_query_csv(self.tmpdir, 2)
+        h = self._run_and_hash_wrapper([
+            {"query_id": 0, "predictions": [{"component": "a"}]},
+            {"query_id": 1, "predictions": [{"component": "b"}]},
+        ])
         self.assertIsInstance(h, str)
         self.assertEqual(len(h), 64)
-        self.assertTrue(output_path.exists())
+        self.assertTrue((self.tmpdir / "out.json").exists())
+
+    def test_run_and_hash_empty_predictions_raises(self):
+        preds = [
+            {"query_id": 0, "predictions": []},
+        ]
+        self._make_query_csv(self.tmpdir, 1)
+        with self.assertRaises(LeakageVerificationError) as ctx:
+            self._run_and_hash_wrapper(preds)
+        self.assertIn("predictions' list is empty", str(ctx.exception))
+
+    def test_run_and_hash_output_missing_query_raises(self):
+        """Output has 1 query but query.csv expects 2."""
+        self._make_query_csv(self.tmpdir, 2)
+        preds = [
+            {"query_id": 0, "predictions": [{"component": "a"}]},
+        ]
+        with self.assertRaises(LeakageVerificationError) as ctx:
+            self._run_and_hash_wrapper(preds)
+        self.assertIn("missing query_ids", str(ctx.exception))
+
+    def test_run_and_hash_duplicate_query_id_raises(self):
+        self._make_query_csv(self.tmpdir, 2)
+        preds = [
+            {"query_id": 0, "predictions": [{"component": "x"}]},
+            {"query_id": 0, "predictions": [{"component": "y"}]},
+        ]
+        with self.assertRaises(LeakageVerificationError) as ctx:
+            self._run_and_hash_wrapper(preds)
+        self.assertIn("Duplicate query_id", str(ctx.exception))
+
+    def test_run_and_hash_extra_query_id_raises(self):
+        """query.csv has 1 row but output has query_id=1 too."""
+        self._make_query_csv(self.tmpdir, 1)
+        preds = [
+            {"query_id": 0, "predictions": [{"component": "a"}]},
+            {"query_id": 1, "predictions": [{"component": "b"}]},
+        ]
+        with self.assertRaises(LeakageVerificationError) as ctx:
+            self._run_and_hash_wrapper(preds)
+        self.assertIn("extra query_ids", str(ctx.exception))
+
+    # --- _read_query_csv_ids unit tests ---
+
+    def test_read_query_csv_ids_empty_csv_returns_empty_set(self):
+        query_path = self.tmpdir / "query.csv"
+        with open(query_path, "w", newline="") as f:
+            writer = csv.DictWriter(
+                f, fieldnames=["task_index", "instruction", "scoring_points"])
+            writer.writeheader()
+        ids = _read_query_csv_ids(str(self.tmpdir))
+        self.assertEqual(ids, set())
+
+    def test_read_query_csv_ids_three_rows_returns_0_1_2(self):
+        self._make_query_csv(self.tmpdir, 3)
+        ids = _read_query_csv_ids(str(self.tmpdir))
+        self.assertEqual(ids, {0, 1, 2})
 
 
 if __name__ == "__main__":
