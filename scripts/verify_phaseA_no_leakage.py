@@ -110,7 +110,8 @@ def create_safe_temp_dataset_view(orig_data_dir, temp_data_dir):
     Rules:
     - query.csv: physically copied as a regular file (follows symlinks).
     - record.csv: if present, physically copied as a regular file.
-    - telemetry/: symlinked to the original directory (read-only sharing).
+    - telemetry/: symlinked to the original directory (shared by symlink;
+      read-only by harness convention).
     - No large telemetry files are duplicated.
 
     Args:
@@ -118,11 +119,38 @@ def create_safe_temp_dataset_view(orig_data_dir, temp_data_dir):
         temp_data_dir: Target directory for the temp view (created if needed).
 
     Raises:
-        LeakageVerificationError: If mandatory files are missing.
+        LeakageVerificationError: If mandatory files are missing,
+            if temp dir would overwrite the original data dir or its subtree,
+            or if temp dir already exists and is non-empty.
     """
-    orig = Path(orig_data_dir)
-    temp = Path(temp_data_dir)
-    temp.mkdir(parents=True, exist_ok=True)
+    orig = Path(orig_data_dir).resolve()
+    temp = Path(temp_data_dir).resolve()
+
+    if temp == orig:
+        raise LeakageVerificationError(
+            f"temp_data_dir ({temp}) must not be the same as "
+            f"orig_data_dir ({orig})")
+
+    try:
+        temp.relative_to(orig)
+        raise LeakageVerificationError(
+            f"temp_data_dir ({temp}) must not be a subdirectory of "
+            f"orig_data_dir ({orig})")
+    except ValueError:
+        pass
+
+    if temp.exists():
+        if any(temp.iterdir()):
+            raise LeakageVerificationError(
+                f"temp_data_dir ({temp}) already exists and is non-empty; "
+                f"refusing to overwrite existing data")
+    else:
+        temp.mkdir(parents=True, exist_ok=False)
+
+    telemetry_orig = orig / "telemetry"
+    if not telemetry_orig.exists():
+        raise LeakageVerificationError(
+            f"telemetry/ not found in orig_data_dir ({orig})")
 
     query_orig = orig / "query.csv"
     if not query_orig.exists():
@@ -136,12 +164,10 @@ def create_safe_temp_dataset_view(orig_data_dir, temp_data_dir):
         record_tmp = temp / "record.csv"
         shutil.copy2(str(record_orig), str(record_tmp))
 
-    telemetry_orig = orig / "telemetry"
     telemetry_tmp = temp / "telemetry"
-    if telemetry_orig.exists():
-        if telemetry_tmp.exists():
-            telemetry_tmp.unlink()
-        telemetry_tmp.symlink_to(telemetry_orig.resolve(), target_is_directory=True)
+    if telemetry_tmp.exists():
+        telemetry_tmp.unlink()
+    telemetry_tmp.symlink_to(telemetry_orig.resolve(), target_is_directory=True)
 
 
 # ---------------------------------------------------------------------------

@@ -470,6 +470,49 @@ class LeakageBoundaryTest(unittest.TestCase):
             big_temp.resolve(), big_orig.resolve(),
             "file must point to original, not a duplicate")
 
+    # --- New temp dir safety guard tests (6.2.1.4) ---
+
+    def test_temp_dir_same_as_orig_dir_raises(self):
+        orig = self._make_orig_dataset(self.tmpdir)
+        with self.assertRaises(LeakageVerificationError) as ctx:
+            create_safe_temp_dataset_view(str(orig), str(orig))
+        self.assertIn("must not be the same", str(ctx.exception))
+
+    def test_temp_dir_is_subdir_of_orig_raises(self):
+        orig = self._make_orig_dataset(self.tmpdir)
+        subdir = orig / "sub_view"
+        with self.assertRaises(LeakageVerificationError) as ctx:
+            create_safe_temp_dataset_view(str(orig), str(subdir))
+        self.assertIn("must not be a subdirectory", str(ctx.exception))
+
+    def test_temp_dir_exists_and_nonempty_raises(self):
+        orig = self._make_orig_dataset(self.tmpdir)
+        temp = self.tmpdir / "existing_nonempty"
+        temp.mkdir()
+        (temp / "some_file.txt").write_text("pre-existing content")
+        with self.assertRaises(LeakageVerificationError) as ctx:
+            create_safe_temp_dataset_view(str(orig), str(temp))
+        self.assertIn("already exists and is non-empty", str(ctx.exception))
+
+    def test_temp_dir_new_external_created_ok(self):
+        orig = self._make_orig_dataset(self.tmpdir)
+        temp = self.tmpdir / "brand_new_view"
+        create_safe_temp_dataset_view(str(orig), str(temp))
+        self.assertTrue(temp.exists())
+        self.assertTrue((temp / "query.csv").exists())
+        self.assertTrue((temp / "telemetry").is_symlink())
+
+    def test_telemetry_missing_in_orig_raises(self):
+        orig_dir = self.tmpdir / "orig_no_tele"
+        orig_dir.mkdir()
+        (orig_dir / "query.csv").write_text(
+            "task_index,instruction,scoring_points\n"
+            "task_1,Find,GT\n")
+        temp = self.tmpdir / "temp_view"
+        with self.assertRaises(LeakageVerificationError) as ctx:
+            create_safe_temp_dataset_view(str(orig_dir), str(temp))
+        self.assertIn("telemetry/ not found", str(ctx.exception))
+
 
 if __name__ == "__main__":
     unittest.main()
