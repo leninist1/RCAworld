@@ -979,6 +979,161 @@ class PhaseAOpenRCAExportTest(unittest.TestCase):
         finally:
             os.unlink(output_path)
 
+    # --- file_evaluate() -compatible protocol tests ---
+
+    def _make_query_csv(self, rows, tmpdir):
+        """Write a minimal query.csv with instruction, scoring_points, task_index."""
+        query_path = tmpdir / "query.csv"
+        with query_path.open("w", newline="") as f:
+            writer = csv.DictWriter(
+                f, fieldnames=["task_index", "instruction", "scoring_points"])
+            writer.writeheader()
+            for r in rows:
+                writer.writerow(r)
+        return str(query_path)
+
+    def test_file_evaluate_compatible_parses_all_rows(self):
+        from fixtures.openrca_evaluate import file_evaluate_compatible
+
+        entries = [
+            {"system": "Bank", "query_id": 0, "need_time": False,
+             "need_component": True, "need_reason": False,
+             "predictions": [{"score": 0.95, "component": "mysql01"}]},
+            {"system": "Bank", "query_id": 1, "need_time": True,
+             "need_component": False, "need_reason": False,
+             "predictions": [{"score": 0.88, "datetime": "2024-01-01 09:12:00"}]},
+            {"system": "Bank", "query_id": 2, "need_time": True,
+             "need_component": True, "need_reason": False,
+             "predictions": [
+                 {"score": 0.85, "datetime": "2024-01-01 09:40:00",
+                  "component": "redis01"},
+                 {"score": 0.95, "datetime": "2024-01-01 09:12:00",
+                  "component": "mysql01"},
+             ]},
+        ]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            pred_path = tmp / "prediction.csv"
+            query_path = self._make_query_csv([
+                {"task_index": "task_3", "instruction": "Find component",
+                 "scoring_points": "The only predicted root cause component is mysql01"},
+                {"task_index": "task_1", "instruction": "Find time",
+                 "scoring_points": "The only root cause occurrence time is within 1 minutes (i.e., <=1min) of 2024-01-01 09:12:00"},
+                {"task_index": "task_5", "instruction": "Find time+comp",
+                 "scoring_points": "The 1-th root cause occurrence time is within 1 minutes (i.e., <=1min) of 2024-01-01 09:12:00\nThe 1-th predicted root cause component is mysql01\nThe 2-th root cause occurrence time is within 1 minutes (i.e., <=1min) of 2024-01-01 09:40:00\nThe 2-th predicted root cause component is redis01"},
+            ], tmp)
+
+            written = export_prediction_csv(entries, str(pred_path))
+            self.assertEqual(written, 3)
+
+            results = file_evaluate_compatible(str(pred_path), query_path)
+            self.assertEqual(len(results), 3)
+
+            # Row 0: component-only
+            self.assertEqual(results[0]["task_index"], "task_3")
+            self.assertEqual(len(results[0]["prediction_parsed"]), 1)
+            self.assertEqual(results[0]["prediction_parsed"][0]["root cause component"],
+                             "mysql01")
+
+            # Row 1: time-only
+            self.assertEqual(results[1]["task_index"], "task_1")
+            self.assertEqual(len(results[1]["prediction_parsed"]), 1)
+            self.assertEqual(results[1]["prediction_parsed"][0][
+                "root cause occurrence datetime"], "2024-01-01 09:12:00")
+
+            # Row 2: multi-fault time+component
+            self.assertEqual(results[2]["task_index"], "task_5")
+            self.assertEqual(len(results[2]["prediction_parsed"]), 2)
+            self.assertEqual(results[2]["prediction_parsed"][0][
+                "root cause occurrence datetime"], "2024-01-01 09:12:00")
+            self.assertEqual(results[2]["prediction_parsed"][0][
+                "root cause component"], "mysql01")
+            self.assertEqual(results[2]["prediction_parsed"][1][
+                "root cause occurrence datetime"], "2024-01-01 09:40:00")
+            self.assertEqual(results[2]["prediction_parsed"][1][
+                "root cause component"], "redis01")
+
+    def test_row_id_sorting_aligns_with_query_csv(self):
+        """When prediction.csv rows are shuffled, row_id sorting restores order."""
+        from fixtures.openrca_evaluate import file_evaluate_compatible
+
+        entries = [
+            {"system": "Bank", "query_id": 0, "need_time": False,
+             "need_component": True, "need_reason": False,
+             "predictions": [{"score": 0.95, "component": "a"}]},
+            {"system": "Bank", "query_id": 1, "need_time": False,
+             "need_component": True, "need_reason": False,
+             "predictions": [{"score": 0.88, "component": "b"}]},
+            {"system": "Bank", "query_id": 2, "need_time": False,
+             "need_component": True, "need_reason": False,
+             "predictions": [{"score": 0.80, "component": "c"}]},
+        ]
+        query_rows = [
+            {"task_index": "task_3", "instruction": "A",
+             "scoring_points": "The only predicted root cause component is a"},
+            {"task_index": "task_3", "instruction": "B",
+             "scoring_points": "The only predicted root cause component is b"},
+            {"task_index": "task_3", "instruction": "C",
+             "scoring_points": "The only predicted root cause component is c"},
+        ]
+
+        # Export in order 0,1,2
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            pred_path = tmp / "prediction.csv"
+            query_path = self._make_query_csv(query_rows, tmp)
+            export_prediction_csv(entries, str(pred_path))
+
+            # Read back, shuffle rows, write back
+            with open(pred_path, "r", newline="") as f:
+                pred_rows = list(csv.DictReader(f))
+            self.assertEqual(len(pred_rows), 3)
+            # Reverse order: row_ids 2, 1, 0
+            pred_rows.reverse()
+            with open(pred_path, "w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=["row_id", "prediction",
+                                                       "system"])
+                writer.writeheader()
+                writer.writerows(pred_rows)
+
+            results = file_evaluate_compatible(str(pred_path), query_path)
+            self.assertEqual(len(results), 3)
+            # After sorting by row_id, results should align:
+            #   result[0] → component a, result[1] → b, result[2] → c
+            self.assertEqual(results[0]["prediction_parsed"][0]["root cause component"], "a")
+            self.assertEqual(results[1]["prediction_parsed"][0]["root cause component"], "b")
+            self.assertEqual(results[2]["prediction_parsed"][0]["root cause component"], "c")
+
+    def test_length_mismatch_raises_value_error(self):
+        from fixtures.openrca_evaluate import file_evaluate_compatible
+
+        entries = [
+            {"system": "Bank", "query_id": 0, "need_time": False,
+             "need_component": True, "need_reason": False,
+             "predictions": [{"score": 0.95, "component": "a"}]},
+            {"system": "Bank", "query_id": 1, "need_time": False,
+             "need_component": True, "need_reason": False,
+             "predictions": [{"score": 0.88, "component": "b"}]},
+        ]
+        query_rows = [
+            {"task_index": "task_3", "instruction": "A",
+             "scoring_points": "The only predicted root cause component is a"},
+            {"task_index": "task_3", "instruction": "B",
+             "scoring_points": "The only predicted root cause component is b"},
+            {"task_index": "task_3", "instruction": "C",
+             "scoring_points": "The only predicted root cause component is c"},
+        ]  # 3 rows vs 2 predictions
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            pred_path = tmp / "prediction.csv"
+            query_path = self._make_query_csv(query_rows, tmp)
+            export_prediction_csv(entries, str(pred_path))
+
+            with self.assertRaises(ValueError) as ctx:
+                file_evaluate_compatible(str(pred_path), query_path)
+            self.assertIn("length", str(ctx.exception).lower())
+
 
 if __name__ == "__main__":
     unittest.main()
