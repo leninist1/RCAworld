@@ -648,71 +648,71 @@ class OnsetHeadInferenceTest(unittest.TestCase):
     def test_c_exact_overlap_average(self):
         from phaseA_run_inference import compute_residuals_and_latents
 
+        # ws=23, stride=11, T=30:
+        #   starts = range(0, 30-23, 11) = [0]
+        #   last_start = max(0, 30-23-1) = 6
+        #   final starts = [0, 6]
+        # Window 0: tensor[0:24]  → predictions cover tg=1..23
+        # Window 1: tensor[6:30]  → predictions cover tg=7..29
+        # Overlap: tg=7..23 (average of 2.0 and 6.0 = 4.0)
+        # w0-only: tg=1..6 → 2.0
+        # w1-only: tg=24..29 → 6.0
+        # tg=0: uncovered
+
         T, N, D = 30, 2, 16
         tensor = np.ones((T, N, D), dtype=np.float32)
         type_idx = np.zeros(N, dtype=np.int32)
         obs_mask = np.ones((T, N, D), dtype=np.float32)
 
         class _MockModel:
-            def __init__(self):
-                self._call_count = 0
-                self.use_posterior_calls = []
-
             def apply(self, variables, x, type_idx, rng, obs_mask=None,
                       use_posterior=False):
-                self.use_posterior_calls.append(use_posterior)
                 B = x.shape[0]
                 ws_inner = x.shape[1] - 1
                 Nx = x.shape[2]
                 res = np.zeros((B, ws_inner, Nx), dtype=np.float32)
                 h_seq = np.zeros((B, ws_inner, Nx, 256), dtype=np.float32)
 
-                # window 0 → 2, window 1 → 6, etc.
-                onset_val = 2.0
-                if self._call_count == 1:
-                    onset_val = 6.0
-                onset = np.full((B, ws_inner, Nx), onset_val,
-                                dtype=np.float32)
-                self._call_count += 1
+                onset = np.zeros((B, ws_inner, Nx), dtype=np.float32)
+                for b in range(B):
+                    onset[b, :, :] = 2.0 if b == 0 else 6.0
+
                 return {
                     "residual": res,
                     "h_seq": h_seq,
                     "onset": {"onset_score": onset},
                 }
 
-        mock = _MockModel()
         _, _, onset_acc, coverage = compute_residuals_and_latents(
-            mock, None, tensor, type_idx, obs_mask, use_posterior=False,
-            ws=23)
+            _MockModel(), None, tensor, type_idx, obs_mask,
+            use_posterior=False, ws=23)
 
-        # Find an overlapped position: with ws=23, stride=11, T=30:
-        # starts=[0, 11, 6] (tail last_start = max(0, 30-23-1) = 6)
-        # windows: [0:24], [11:31→30], [6:30]
-        # Overlap: timesteps in [12:24] are covered by windows 0 and 1+2
-        # Window 0 onset=2, Window 1 onset=6, Window 2 onset=?
-        # Let's find positions covered by exactly window 0 (2) and window 1 (6)
-        # t=12 is covered by window 0 (s=0, t=12→tg=13) and window 1 (s=11, t=1→tg=12)
-        # Hmm, the index math is complex. Let's just verify that covered values are >0
-        # and non-covered are 0.
+        on0 = onset_acc[:, 0]
 
-        covered = np.where(coverage)[0]
-        self.assertGreater(len(covered), 0)
+        # tg=0: uncovered
+        self.assertFalse(coverage[0])
+        self.assertEqual(float(on0[0]), 0.0)
 
-        # All covered onset values must be > 0 (since mock returns positive vals)
-        for t in covered:
-            self.assertGreater(float(onset_acc[t, 0]), 0.0,
-                               f"covered t={t} must have onset>0")
+        # tg=1..6: window 0 only → 2.0
+        for t in range(1, 7):
+            self.assertAlmostEqual(float(on0[t]), 2.0, places=4,
+                                   msg=f"tg={t}: w0-only, expected 2.0")
+            self.assertTrue(coverage[t])
 
-        # Non-covered timesteps must be exactly 0
-        non_covered = np.where(~coverage)[0]
-        for t in non_covered:
-            self.assertEqual(float(onset_acc[t, 0]), 0.0,
-                             f"non-covered t={t} must have onset=0")
+        # tg=7..23: overlap → average = 4.0
+        for t in range(7, 24):
+            self.assertAlmostEqual(float(on0[t]), 4.0, places=4,
+                                   msg=f"tg={t}: overlap, expected 4.0")
+            self.assertTrue(coverage[t])
 
-        # Verify at least one position gets average of two windows
-        # With only 2 mock calls, we can find positions that have onset != 2,6,4
-        # Actually window 0=2, window1=6, window2 (if exists) would be 10
-        # Let's just verify the mock was called at least twice
+        # tg=24..29: window 1 only → 6.0
+        for t in range(24, 30):
+            self.assertAlmostEqual(float(on0[t]), 6.0, places=4,
+                                   msg=f"tg={t}: w1-only, expected 6.0")
+            self.assertTrue(coverage[t])
+
+        # tail coverage: last timestep must be covered
+        self.assertTrue(coverage[29], "tail t=29 must be covered")
     
     # ── Test D: prior-only enforced (runtime check, not source string) ──
 
