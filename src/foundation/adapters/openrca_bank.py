@@ -13,7 +13,7 @@ Entity model:
 import os
 import re
 from collections import defaultdict
-from typing import List, Optional, Dict, Any, Set
+from typing import List, Optional, Dict, Any, Set, Tuple
 from glob import glob
 
 import numpy as np
@@ -83,12 +83,18 @@ class OpenRCABankAdapter(BaseAdapter):
 
     def __init__(self, max_days: int = 5, max_container_timestamps: int = 5000,
                  max_container_events: int = 50000, max_container_rows: int = 300000,
-                 include_dates: Optional[Set[str]] = None):
+                 include_dates: Optional[Set[str]] = None,
+                 canonicalization_mode: str = "legacy"):
+        if canonicalization_mode not in ("legacy", "bank_safe_v1"):
+            raise ValueError(
+                f"Invalid canonicalization_mode: {canonicalization_mode!r}. "
+                "Must be 'legacy' or 'bank_safe_v1'.")
         self.max_days = max_days
         self.max_container_timestamps = max_container_timestamps
         self.max_container_events = max_container_events
         self.max_container_rows = max_container_rows
         self.include_dates = include_dates  # if set, only load these date dirs
+        self.canonicalization_mode = canonicalization_mode
 
     def _get_days(self, data_dir: str) -> List[str]:
         telemetry_dir = os.path.join(data_dir, "telemetry")
@@ -104,6 +110,32 @@ class OpenRCABankAdapter(BaseAdapter):
         for cat, pat in self.CONTAINER_KPI_PATTERNS:
             if pat.match(str(kpi_name)):
                 return cat
+        return None
+
+    def _canonicalize_container_metric(
+        self,
+        category: str,
+        value: float,
+    ) -> Optional[Tuple[str, float]]:
+        if self.canonicalization_mode == "legacy":
+            return (category, value)
+
+        # bank_safe_v1
+        if category == "cpu":
+            return ("cpu", value)
+        if category == "mem":
+            return ("mem", value)
+        if category == "net_rx":
+            return ("net_rx", float(np.log1p(max(value, 0.0))))
+        if category == "net_tx":
+            return ("net_tx", float(np.log1p(max(value, 0.0))))
+
+        # These categories are not safely aligned with OB slots yet
+        if category in ("jvm_cpu", "mem_usage", "jvm_mem",
+                        "disk_io", "mysql_io",
+                        "threads", "sessions", "fgc"):
+            return None
+
         return None
 
     # ---- Entity Discovery ----
@@ -293,12 +325,16 @@ class OpenRCABankAdapter(BaseAdapter):
                         continue
                     ts = self._safe_int(row[ts_col])
                     val = self._safe_float(row[val_col])
+                    result = self._canonicalize_container_metric(cat, val)
+                    if result is None:
+                        continue
+                    feat_name, feat_val = result
                     events.append(ObservationEvent(
                         timestamp=ts,
                         entity_id=entity,
                         modality=Modality.METRIC,
-                        feature_name=cat,
-                        value=val,
+                        feature_name=feat_name,
+                        value=feat_val,
                     ))
                     if len(events) >= self.max_container_events:
                         break

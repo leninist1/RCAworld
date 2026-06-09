@@ -70,14 +70,15 @@ SYSTEM_CONFIGS = {
 }
 
 
-def _make_adapter(adapter_cls_name, include_dates):
+def _make_adapter(adapter_cls_name, include_dates, canonicalization_mode="legacy"):
     from foundation.adapters import (
         OpenRCABankAdapter, OpenRCATelecomAdapter, OpenRCAMarketAdapter,
     )
     cls_map = {
         "OpenRCABankAdapter": lambda: OpenRCABankAdapter(
             max_days=99, max_container_events=500000, max_container_rows=5000000,
-            include_dates=include_dates),
+            include_dates=include_dates,
+            canonicalization_mode=canonicalization_mode),
         "OpenRCATelecomAdapter": lambda: OpenRCATelecomAdapter(
             max_days=99, max_container_timestamps=5000,
             include_dates=include_dates),
@@ -225,7 +226,7 @@ def build_prediction_entry(system, query_id, predictions, component_ranking, iq)
 
 def run_inference(sys_name, model, state, ob_mean, ob_std, use_posterior,
                    scoring_method, all_zero_type, burn_in_min, resample_sec,
-                   lambda_onset=0.0):
+                   lambda_onset=0.0, bank_canonicalization="legacy"):
     """Run inference for one system — ZERO GT access."""
     if scoring_method == "onset_head" and lambda_onset <= 0:
         raise ValueError(
@@ -261,7 +262,8 @@ def run_inference(sys_name, model, state, ob_mean, ob_std, use_posterior,
     needed_dates_set = set(d for d in available_dates
                            if min_date_str <= d <= max_date_str)
 
-    adapter = _make_adapter(cfg["adapter_cls"], needed_dates_set)
+    adapter = _make_adapter(cfg["adapter_cls"], needed_dates_set,
+                            canonicalization_mode=bank_canonicalization)
     all_entities = adapter.discover_entities(data_dir)
     cont_entities = [e for e in all_entities
                      if e.entity_type.value in ("container", "service")]
@@ -394,6 +396,10 @@ def main():
     parser.add_argument('--lambda-onset', type=float, default=0.0,
                         help='Weight for learned onset head scores in joint S[t,c]; '
                              'default 0.0 preserves Phase 0.8 behavior')
+    parser.add_argument('--bank-canonicalization', type=str, default='legacy',
+                        choices=['legacy', 'bank_safe_v1'],
+                        help='Canonicalization mode for Bank adapter; '
+                             'default legacy preserves pre-0.9.2.3a behavior')
     args = parser.parse_args()
 
     print("=" * 60)
@@ -439,6 +445,7 @@ def main():
             burn_in_min=args.burn_in_min,
             resample_sec=args.resample_sec,
             lambda_onset=args.lambda_onset,
+            bank_canonicalization=args.bank_canonicalization,
         )
         elapsed = time.time() - t0
         all_predictions.extend(preds)
