@@ -31,7 +31,6 @@ from flax.training import train_state as flax_train_state
 import orbax.checkpoint as ocp
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
-os.environ['CUDA_VISIBLE_DEVICES'] = '1'
 os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'true'
 
 from foundation.models import RCAWorldFoundation
